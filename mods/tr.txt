@@ -1,0 +1,706 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+import 'dart:ui' as ui;
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
+import 'package:google_mlkit_translation/google_mlkit_translation.dart';
+import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
+import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:violet/component/hitomi/hybrid_loader.dart';
+import 'package:violet/database/query.dart';
+import 'package:violet/pages/viewer/viewer_page_provider.dart';
+enum MangaTranslateMode { off, auto, japanese, chinese, english }
+class MangaTranslateBox {
+MangaTranslateBox(this.rect, this.text, this.fill, this.ink);
+final Rect rect; // 그림 기준 위치 (스크롤 보정 전)
+final String text;
+final Color fill;
+final Color ink;
+}
+class MangaTranslate {
+MangaTranslate._();
+static final MangaTranslate instance = MangaTranslate._();
+static const String _kKeyPref = 'manga_translate_deepl_key';
+static const String _kModePref = 'manga_translate_mode';
+final ValueNotifier<MangaTranslateMode> mode = ValueNotifier(
+MangaTranslateMode.off,
+);
+final ValueNotifier<List<MangaTranslateBox>> boxes = ValueNotifier(const []);
+final ValueNotifier<Offset> scroll = ValueNotifier(Offset.zero);
+final ValueNotifier<String> status = ValueNotifier('');
+final ValueNotifier<String> articleLang = ValueNotifier('');
+final ValueNotifier<String> deeplKey = ValueNotifier('');
+GlobalKey? activeKey;
+int? _articleId;
+double dpr = 1.0;
+bool _loaded = false;
+bool _hintShown = false;
+Timer? _timer;
+int _gen = 0;
+bool _busy = false;
+final Map<TextRecognitionScript, TextRecognizer> _recognizers = {};
+final Map<String, OnDeviceTranslator> _translators = {};
+final Map<String, String> _cache = {};
+static final RegExp _cjk = RegExp(
+r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff66-\uff9f]',
+);
+static final RegExp _hangul = RegExp(r'[\uac00-\ud7a3]');
+static final RegExp _latinWord = RegExp(r'[A-Za-z\u00c0-\u024f]{2,}');
+static const Map<String, String> _latinLangs = {
+'english': 'en', 'spanish': 'es', 'french': 'fr', 'german': 'de',
+'italian': 'it', 'portuguese': 'pt', 'vietnamese': 'vi',
+'indonesian': 'id', 'tagalog': 'tl', 'polish': 'pl', 'dutch': 'nl',
+'turkish': 'tr', 'hungarian': 'hu', 'czech': 'cs', 'finnish': 'fi',
+'swedish': 'sv', 'norwegian': 'no', 'danish': 'da', 'romanian': 'ro',
+'catalan': 'ca', 'estonian': 'et', 'albanian': 'sq', 'slovak': 'sk',
+'croatian': 'hr', 'lithuanian': 'lt', 'latvian': 'lv', 'slovenian': 'sl',
+'malay': 'ms', 'esperanto': 'eo', 'galician': 'gl', 'icelandic': 'is',
+'irish': 'ga', 'welsh': 'cy', 'afrikaans': 'af', 'swahili': 'sw',
+};
+static const Map<String, String> _deeplSource = {
+'ja': 'JA', 'zh': 'ZH', 'en': 'EN', 'es': 'ES', 'fr': 'FR', 'de': 'DE',
+'it': 'IT', 'pt': 'PT', 'nl': 'NL', 'pl': 'PL', 'id': 'ID', 'tr': 'TR',
+'cs': 'CS', 'da': 'DA', 'fi': 'FI', 'hu': 'HU', 'lt': 'LT', 'lv': 'LV',
+'no': 'NB', 'ro': 'RO', 'sk': 'SK', 'sl': 'SL', 'sv': 'SV', 'et': 'ET',
+};
+static const Map<String, String> _koNames = {
+'japanese': '일본어', 'chinese': '중국어', 'english': '영어',
+'korean': '한국어', 'spanish': '스페인어', 'french': '프랑스어',
+'german': '독일어', 'italian': '이탈리아어', 'portuguese': '포르투갈어',
+'vietnamese': '베트남어', 'indonesian': '인도네시아어', 'russian': '러시아어',
+'thai': '태국어', 'polish': '폴란드어', 'tagalog': '타갈로그어',
+'turkish': '터키어', 'dutch': '네덜란드어', 'arabic': '아랍어',
+'ukrainian': '우크라이나어', 'greek': '그리스어',
+};
+static String koName(String lang) => _koNames[lang] ?? lang;
+bool get hasKey => deeplKey.value.trim().isNotEmpty;
+Future<void> load() async {
+if (_loaded) return;
+_loaded = true;
+try {
+final prefs = await SharedPreferences.getInstance();
+deeplKey.value = prefs.getString(_kKeyPref) ?? '';
+final m = prefs.getInt(_kModePref);
+if (m != null && m >= 0 && m < MangaTranslateMode.values.length) {
+mode.value = MangaTranslateMode.values[m];
+schedule(const Duration(milliseconds: 800));
+}
+} catch (_) {}
+}
+Future<void> setDeeplKey(String key) async {
+deeplKey.value = key.trim();
+_cache.clear();
+try {
+final prefs = await SharedPreferences.getInstance();
+await prefs.setString(_kKeyPref, deeplKey.value);
+} catch (_) {}
+hide();
+schedule(const Duration(milliseconds: 150));
+}
+Future<void> setArticle(int id) async {
+if (_articleId == id) return;
+_articleId = id;
+articleLang.value = '';
+String lang = '';
+try {
+final local = await QueryManager.queryIds([id]).timeout(
+const Duration(seconds: 5),
+);
+if (local.isNotEmpty) lang = '${local.first.result['Language'] ?? ''}';
+} catch (_) {}
+if (lang.isEmpty) {
+try {
+final cached = await HybridLoader.getCachedMetadataBatch([id]).timeout(
+const Duration(seconds: 5),
+);
+final q = cached[id];
+if (q != null) lang = '${q.result['Language'] ?? ''}';
+} catch (_) {}
+}
+if (lang.isEmpty) {
+try {
+final q = await HybridLoader.idQueryHitomiFast(id).timeout(
+const Duration(seconds: 8),
+);
+lang = '${q.result['Language'] ?? ''}';
+} catch (_) {}
+}
+if (_articleId != id) return;
+articleLang.value = lang.trim().toLowerCase();
+}
+(TextRecognitionScript, String)? _source(MangaTranslateMode m) {
+switch (m) {
+case MangaTranslateMode.off:
+return null;
+case MangaTranslateMode.japanese:
+return (TextRecognitionScript.japanese, 'ja');
+case MangaTranslateMode.chinese:
+return (TextRecognitionScript.chinese, 'zh');
+case MangaTranslateMode.english:
+return (TextRecognitionScript.latin, 'en');
+case MangaTranslateMode.auto:
+final lang = articleLang.value;
+if (lang.isEmpty || lang == 'n/a' || lang == 'japanese') {
+return (TextRecognitionScript.japanese, 'ja');
+}
+if (lang == 'chinese') return (TextRecognitionScript.chinese, 'zh');
+final code = _latinLangs[lang];
+if (code != null) return (TextRecognitionScript.latin, code);
+return null;
+}
+}
+void cycle() {
+final values = MangaTranslateMode.values;
+mode.value = values[(mode.value.index + 1) % values.length];
+hide();
+status.value = '';
+SharedPreferences.getInstance()
+.then((p) => p.setInt(_kModePref, mode.value.index))
+.catchError((_) => true);
+if (mode.value != MangaTranslateMode.off) {
+schedule(const Duration(milliseconds: 150));
+}
+}
+void hide() {
+_gen++;
+_timer?.cancel();
+if (boxes.value.isNotEmpty) boxes.value = const [];
+}
+void cancelPending() => _timer?.cancel();
+void schedule([Duration delay = const Duration(milliseconds: 600)]) {
+if (mode.value == MangaTranslateMode.off) return;
+_timer?.cancel();
+_timer = Timer(delay, _run);
+}
+void onScroll(ScrollUpdateNotification n) {
+final d = n.scrollDelta;
+if (d == null || d == 0) return;
+final dir = n.metrics.axisDirection;
+final v = (dir == AxisDirection.up || dir == AxisDirection.left) ? -d : d;
+scroll.value = n.metrics.axis == Axis.vertical
+? scroll.value.translate(0, v)
+: scroll.value.translate(v, 0);
+}
+TextRecognizer _getRecognizer(TextRecognitionScript script) =>
+_recognizers.putIfAbsent(script, () => TextRecognizer(script: script));
+Future<OnDeviceTranslator> _getTranslator(String code) async {
+final current = _translators[code];
+if (current != null) return current;
+final src = TranslateLanguage.values.firstWhere(
+(e) => e.bcpCode == code,
+orElse: () => TranslateLanguage.english,
+);
+final manager = OnDeviceTranslatorModelManager();
+for (final lang in [src, TranslateLanguage.korean]) {
+if (!await manager.isModelDownloaded(lang.bcpCode)) {
+status.value = '번역 모델 받는 중... (언어마다 처음 한 번만, 수십 MB)';
+await manager.downloadModel(lang.bcpCode, isWifiRequired: false);
+}
+}
+final created = OnDeviceTranslator(
+sourceLanguage: src,
+targetLanguage: TranslateLanguage.korean,
+);
+_translators[code] = created;
+return created;
+}
+Future<List<String>> _deepl(List<String> texts, String code) async {
+final key = deeplKey.value.trim();
+final host = key.endsWith(':fx') ? 'api-free.deepl.com' : 'api.deepl.com';
+final body = <String, dynamic>{
+'text': texts,
+'target_lang': 'KO',
+'context':
+'Speech-bubble dialogue from a manga (comic book). '
+'Translate into natural, casual spoken Korean.',
+};
+final src = _deeplSource[code];
+if (src != null) body['source_lang'] = src;
+for (var attempt = 0; attempt < 2; attempt++) {
+final res = await http
+.post(
+Uri.https(host, '/v2/translate'),
+headers: {
+'Authorization': 'DeepL-Auth-Key $key',
+'Content-Type': 'application/json',
+},
+body: jsonEncode(body),
+)
+.timeout(const Duration(seconds: 15));
+if (res.statusCode == 200) {
+final j = jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
+final list = (j['translations'] as List)
+.map((e) => '${(e as Map)['text']}')
+.toList();
+if (list.length != texts.length) throw 'DeepL 응답이 이상해요';
+return list;
+}
+if (res.statusCode == 400 && body.containsKey('context')) {
+body.remove('context');
+continue;
+}
+if (res.statusCode == 403) throw 'DeepL 키가 맞지 않아요';
+if (res.statusCode == 456) throw 'DeepL 이번 달 무료 사용량을 다 썼어요';
+throw 'DeepL 오류 (${res.statusCode})';
+}
+throw 'DeepL 오류';
+}
+String? _prepare(String raw, TextRecognitionScript script) {
+if (_hangul.hasMatch(raw)) return null; // 이미 한국어
+if (script == TextRecognitionScript.latin) {
+var s = raw
+.replaceAll(RegExp(r'-\s*\n\s*'), '')
+.replaceAll(RegExp(r'\s+'), ' ')
+.trim();
+if (!_latinWord.hasMatch(s)) return null;
+if (s.length > 3 && s == s.toUpperCase()) {
+s = s.toLowerCase();
+s = s[0].toUpperCase() + s.substring(1);
+}
+return s;
+}
+final s = raw.replaceAll(RegExp(r'\s+'), '');
+return _cjk.hasMatch(s) ? s : null;
+}
+List<(Rect, String)> _group(
+List<TextBlock> blocks,
+TextRecognitionScript script,
+) {
+final rects = [for (final b in blocks) b.boundingBox];
+final texts = [for (final b in blocks) b.text];
+final n = rects.length;
+final parent = List<int>.generate(n, (i) => i);
+int find(int i) {
+while (parent[i] != i) {
+parent[i] = parent[parent[i]];
+i = parent[i];
+}
+return i;
+}
+double gap(Rect r) =>
+(min(r.width, r.height) * 0.25).clamp(6.0, 24.0).toDouble();
+for (var i = 0; i < n; i++) {
+for (var j = i + 1; j < n; j++) {
+final g = max(gap(rects[i]), gap(rects[j]));
+if (rects[i].inflate(g).overlaps(rects[j].inflate(g))) {
+parent[find(i)] = find(j);
+}
+}
+}
+final groups = <int, List<int>>{};
+for (var i = 0; i < n; i++) {
+groups.putIfAbsent(find(i), () => []).add(i);
+}
+final out = <(Rect, String)>[];
+for (final g in groups.values) {
+var rect = rects[g.first];
+for (final i in g.skip(1)) {
+rect = rect.expandToInclude(rects[i]);
+}
+final vertical =
+script != TextRecognitionScript.latin &&
+g.every((i) => rects[i].height > rects[i].width * 1.2);
+g.sort((x, y) {
+final a = rects[x];
+final b = rects[y];
+if (vertical) return b.center.dx.compareTo(a.center.dx);
+final dy = a.top - b.top;
+if (dy.abs() > min(a.height, b.height) * 0.5) return dy.sign.toInt();
+return a.left.compareTo(b.left);
+});
+final sep = script == TextRecognitionScript.latin ? '\n' : '';
+out.add((rect, g.map((i) => texts[i]).join(sep)));
+}
+return out;
+}
+static (Color, Color) _colors(ByteData raw, int w, int h, Rect r) {
+final rs = <int>[];
+final gs = <int>[];
+final bs = <int>[];
+final rr = r.inflate(6);
+void add(double x, double y) {
+final xi = x.round().clamp(0, w - 1).toInt();
+final yi = y.round().clamp(0, h - 1).toInt();
+final i = (yi * w + xi) * 4;
+rs.add(raw.getUint8(i));
+gs.add(raw.getUint8(i + 1));
+bs.add(raw.getUint8(i + 2));
+}
+const steps = 12;
+for (var k = 0; k <= steps; k++) {
+final fx = rr.left + rr.width * k / steps;
+final fy = rr.top + rr.height * k / steps;
+add(fx, rr.top);
+add(fx, rr.bottom);
+add(rr.left, fy);
+add(rr.right, fy);
+}
+int med(List<int> v) {
+v.sort();
+return v[v.length ~/ 2];
+}
+final fill = Color.fromARGB(255, med(rs), med(gs), med(bs));
+final ink = fill.computeLuminance() > 0.45 ? Colors.black : Colors.white;
+return (fill, ink);
+}
+Future<void> _run() async {
+final m = mode.value;
+if (m == MangaTranslateMode.off) return;
+if (_busy) {
+schedule();
+return;
+}
+_busy = true;
+final gen = _gen;
+String? note;
+try {
+final source = _source(m);
+if (source == null) {
+final lang = articleLang.value;
+status.value = lang == 'korean'
+? '이미 한국어 작품이에요'
+: '${koName(lang)}는 아직 글자 읽기를 지원하지 않아요. 버튼으로 언어를 골라 보세요';
+return;
+}
+final (script, code) = source;
+final ro = activeKey?.currentContext?.findRenderObject();
+if (ro is! RenderRepaintBoundary) return;
+final base = scroll.value;
+final image = await ro.toImage(pixelRatio: dpr);
+final w = image.width;
+final h = image.height;
+final raw = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+final png = await image.toByteData(format: ui.ImageByteFormat.png);
+image.dispose();
+if (raw == null || png == null || gen != _gen) return;
+final dir = await getTemporaryDirectory();
+final file = File('${dir.path}/violet_translate_capture.png');
+await file.writeAsBytes(png.buffer.asUint8List(), flush: true);
+if (gen != _gen) return;
+final recognized = await _getRecognizer(
+script,
+).processImage(InputImage.fromFilePath(file.path));
+if (gen != _gen) return;
+final items = <(Rect, String)>[];
+for (final (rect, text) in _group(recognized.blocks, script)) {
+final src = _prepare(text, script);
+if (src != null) items.add((rect, src));
+}
+final pending = <String>[];
+for (final (_, src) in items) {
+if (!_cache.containsKey('$code|$src') && !pending.contains(src)) {
+pending.add(src);
+}
+}
+if (pending.isNotEmpty) {
+List<String>? got;
+if (hasKey) {
+try {
+final acc = <String>[];
+for (var i = 0; i < pending.length; i += 40) {
+acc.addAll(
+await _deepl(
+pending.sublist(i, min(i + 40, pending.length)),
+code,
+),
+);
+}
+got = acc;
+} catch (e) {
+note = '$e (폰 번역으로 대신했어요)';
+}
+}
+if (got == null) {
+final translator = await _getTranslator(code);
+got = [for (final t in pending) await translator.translateText(t)];
+}
+for (var i = 0; i < pending.length; i++) {
+_cache['$code|${pending[i]}'] = got[i];
+}
+}
+if (gen != _gen) return;
+final out = <MangaTranslateBox>[];
+for (final (rect, src) in items) {
+final ko = _cache['$code|$src'];
+if (ko == null || ko.trim().isEmpty) continue;
+final (fill, ink) = _colors(raw, w, h, rect);
+out.add(
+MangaTranslateBox(
+Rect.fromLTRB(
+rect.left / dpr,
+rect.top / dpr,
+rect.right / dpr,
+rect.bottom / dpr,
+).shift(base),
+ko,
+fill,
+ink,
+),
+);
+}
+boxes.value = out;
+if (note != null) {
+status.value = note;
+} else if (out.isEmpty) {
+status.value = '번역할 글자를 못 찾았어요';
+} else if (!hasKey && !_hintShown) {
+_hintShown = true;
+status.value = '버튼을 길게 누르면 DeepL 키를 넣어서 더 자연스럽게 번역할 수 있어요';
+} else {
+status.value = '';
+}
+} catch (e) {
+if (gen == _gen) status.value = '번역 실패: $e';
+} finally {
+_busy = false;
+}
+}
+}
+class MangaTranslateLayer extends StatefulWidget {
+const MangaTranslateLayer({super.key, required this.child});
+final Widget child;
+@override
+State<MangaTranslateLayer> createState() => _MangaTranslateLayerState();
+}
+class _MangaTranslateLayerState extends State<MangaTranslateLayer> {
+final MangaTranslate t = MangaTranslate.instance;
+final GlobalKey _key = GlobalKey();
+int _pointers = 0;
+@override
+void initState() {
+super.initState();
+t.activeKey = _key;
+t.load();
+t.schedule(const Duration(milliseconds: 1200));
+}
+@override
+void didChangeDependencies() {
+super.didChangeDependencies();
+try {
+t.setArticle(Provider.of<ViewerPageProvider>(context, listen: false).id);
+} catch (_) {}
+}
+@override
+void dispose() {
+t.hide();
+if (identical(t.activeKey, _key)) t.activeKey = null;
+super.dispose();
+}
+void _up() {
+_pointers = max(0, _pointers - 1);
+if (_pointers == 0) t.schedule();
+}
+Widget _box(MangaTranslateBox b) {
+var r = b.rect.inflate(3);
+if (r.width < r.height * 0.6) {
+r = Rect.fromCenter(
+center: r.center,
+width: min(r.height * 0.75, r.width * 2.4),
+height: r.height,
+);
+}
+if (r.width < 40) {
+r = Rect.fromCenter(center: r.center, width: 40, height: r.height);
+}
+final size = (min(r.width, r.height) * 0.38).clamp(10.0, 18.0).toDouble();
+return Positioned.fromRect(
+rect: r,
+child: Container(
+alignment: Alignment.center,
+padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 1),
+decoration: BoxDecoration(
+color: b.fill,
+borderRadius: BorderRadius.circular(8),
+),
+child: FittedBox(
+fit: BoxFit.scaleDown,
+child: SizedBox(
+width: max(r.width - 4, 20.0),
+child: Text(
+b.text,
+textAlign: TextAlign.center,
+style: TextStyle(
+color: b.ink,
+fontSize: size,
+height: 1.2,
+fontWeight: FontWeight.w700,
+letterSpacing: -0.3,
+),
+),
+),
+),
+),
+);
+}
+@override
+Widget build(BuildContext context) {
+t.activeKey = _key;
+t.dpr = MediaQuery.of(context).devicePixelRatio;
+return Stack(
+fit: StackFit.expand,
+children: [
+Listener(
+onPointerDown: (_) {
+_pointers++;
+t.cancelPending();
+if (_pointers >= 2) t.hide(); // 두 손가락 확대 중에는 숨겨요
+},
+onPointerUp: (_) => _up(),
+onPointerCancel: (_) => _up(),
+child: NotificationListener<ScrollNotification>(
+onNotification: (n) {
+if (n is ScrollUpdateNotification) {
+t.onScroll(n);
+t.cancelPending();
+}
+if (n is ScrollEndNotification) {
+t.schedule(const Duration(milliseconds: 500));
+}
+return false;
+},
+child: RepaintBoundary(key: _key, child: widget.child),
+),
+),
+IgnorePointer(
+child: ClipRect(
+child: ValueListenableBuilder<List<MangaTranslateBox>>(
+valueListenable: t.boxes,
+builder: (context, boxes, _) {
+final layer = Stack(
+clipBehavior: Clip.none,
+children: [for (final b in boxes) _box(b)],
+);
+return ValueListenableBuilder<Offset>(
+valueListenable: t.scroll,
+child: layer,
+builder: (context, off, child) =>
+Transform.translate(offset: -off, child: child),
+);
+},
+),
+),
+),
+],
+);
+}
+}
+class MangaTranslateButton extends StatelessWidget {
+const MangaTranslateButton({super.key});
+static String _label(MangaTranslateMode m, String lang, bool deepl) {
+final base = switch (m) {
+MangaTranslateMode.off => '번역 끔',
+MangaTranslateMode.auto =>
+lang.isEmpty ? '번역: 자동' : '번역: 자동 (${MangaTranslate.koName(lang)})',
+MangaTranslateMode.japanese => '번역: 일본어',
+MangaTranslateMode.chinese => '번역: 중국어',
+MangaTranslateMode.english => '번역: 영어',
+};
+return m != MangaTranslateMode.off && deepl ? '$base · DeepL' : base;
+}
+static Future<void> _editKey(BuildContext context) async {
+final t = MangaTranslate.instance;
+final ctrl = TextEditingController(text: t.deeplKey.value);
+final ok = await showDialog<bool>(
+context: context,
+builder: (ctx) => AlertDialog(
+title: const Text('DeepL 번역 키'),
+content: Column(
+mainAxisSize: MainAxisSize.min,
+crossAxisAlignment: CrossAxisAlignment.start,
+children: [
+const Text(
+'DeepL API 키를 넣으면 훨씬 자연스럽게 번역돼요. '
+'비워 두면 폰 안에서 번역해요.',
+style: TextStyle(fontSize: 13),
+),
+const SizedBox(height: 12),
+TextField(
+controller: ctrl,
+autocorrect: false,
+enableSuggestions: false,
+decoration: const InputDecoration(
+hintText: '예) xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:fx',
+),
+),
+],
+),
+actions: [
+TextButton(
+onPressed: () => Navigator.pop(ctx, false),
+child: const Text('취소'),
+),
+TextButton(
+onPressed: () => Navigator.pop(ctx, true),
+child: const Text('저장'),
+),
+],
+),
+);
+if (ok == true) await t.setDeeplKey(ctrl.text);
+}
+@override
+Widget build(BuildContext context) {
+final t = MangaTranslate.instance;
+return Positioned(
+left: 10,
+bottom: 10 + MediaQuery.of(context).padding.bottom,
+child: ListenableBuilder(
+listenable: Listenable.merge([t.mode, t.articleLang, t.deeplKey]),
+builder: (context, _) => _content(context, t),
+),
+);
+}
+Widget _content(BuildContext context, MangaTranslate t) {
+final m = t.mode.value;
+return Column(
+mainAxisSize: MainAxisSize.min,
+crossAxisAlignment: CrossAxisAlignment.start,
+children: [
+ValueListenableBuilder<String>(
+valueListenable: t.status,
+builder: (context, s, _) => s.isEmpty || m == MangaTranslateMode.off
+? const SizedBox.shrink()
+: Container(
+margin: const EdgeInsets.only(bottom: 6),
+padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+constraints: const BoxConstraints(maxWidth: 260),
+decoration: BoxDecoration(
+color: const Color(0xB3000000),
+borderRadius: BorderRadius.circular(8),
+),
+child: Text(
+s,
+style: const TextStyle(color: Colors.white, fontSize: 12),
+),
+),
+),
+GestureDetector(
+onTap: t.cycle,
+onLongPress: () => _editKey(context),
+child: Container(
+padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+decoration: BoxDecoration(
+color: m == MangaTranslateMode.off
+? const Color(0x80000000)
+: const Color(0xE62196F3),
+borderRadius: BorderRadius.circular(18),
+),
+child: Text(
+_label(m, t.articleLang.value, t.hasKey),
+style: const TextStyle(
+color: Colors.white,
+fontSize: 12,
+fontWeight: FontWeight.w600,
+),
+),
+),
+),
+],
+);
+}
+}
