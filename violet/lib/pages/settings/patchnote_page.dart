@@ -25,6 +25,40 @@ class PatchModel {
 
 final patches = [
   PatchModel(
+    dateTime: DateTime(2026, 11, 2),
+    version: '1.35.2 Patch',
+    contents: [
+      'Reading Progress: removed 30-day expiration timer; reading progress, page positions, and completed greyscale indicators are now permanently retained indefinitely',
+      'Reading Progress: automatically restored all historical reading progress and read indicators from local database on update',
+      'Search: fixed short artist/group substring matching bug (e.g. in, yu) using 4-way word boundary pattern matching engine',
+    ],
+    contentsKorean: [
+      '열람 진행도: 30일 경과 시 작품 진행도(읽은 위치/진행바/완독 흑백 표시)가 만료 및 초기화되던 정책을 완전 폐지하고 전 작품 영구 보존으로 개편',
+      '열람 진행도: 기존에 30일이 지나 사라졌던 모든 작품의 진행도와 완독 상태가 업데이트 즉시 100% 정상 복원',
+      '검색: 작가 및 그룹 검색 시 짧은 철자(in, yu 등)의 단어 중간 포함으로 인한 타 작가 오매칭 버그 수정 및 단어 경계(Word Boundary) 매칭 엔진 구축',
+    ],
+  ),
+  PatchModel(
+    dateTime: DateTime(2026, 11, 1),
+    version: '1.35.1 Patch',
+    contents: [
+      'Search: fixed excluded tags filter not dropping items from Nozomi and artist streams',
+      'Search: implemented SSOT excluded tag engine covering prefix, bare tags, and casing',
+      'Search: instant in-memory removal of excluded tags on settings change with automatic refill',
+      'Expunged DB: zero-touch silent background auto-sync from GitHub Releases without user friction',
+      'Expunged DB: updated deleted works archive to 17,285 works based on live Hitomi index',
+      'Settings: show expunged update date under [Include Expunged Works] toggle',
+    ],
+    contentsKorean: [
+      '검색 필터: 기본 제외 태그(male:yaoi, female:furry 등)가 노조미/작가 스트림에서 정상 제외되지 않던 오류 완벽 수정',
+      '검색 필터: 접두사 태그, 단독 태그, 공백/언더스코어 및 대소문자 포괄 매칭 SSOT 제외 판정 엔진 탑재 (검색창 직접 검색어 예외 보호)',
+      '검색 UX: 제외 태그 변경 시 현재 화면 메모리 목록에서 즉시(0ms) 소거 및 부족분 자동 재충전 연동',
+      '삭제작 DB: 사용자 조작 과정 없는 완전 무흔적(사일런트) 백그라운드 온라인 동기화 엔진 탑재',
+      '삭제작 DB: Hitomi 실시간 색인 대조를 통해 최신 삭제작 3건 추가 반영 (총 17,285건 아카이브)',
+      '설정: [삭제된 작품 포함] 토글 하단에 최근 업데이트 날짜 표시',
+    ],
+  ),
+  PatchModel(
     dateTime: DateTime(2026, 10, 29),
     version: '1.35.0 Patch',
     contents: [
