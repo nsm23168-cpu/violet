@@ -57,22 +57,28 @@ jobs:
      List<(String, ArtistType)> artists = [];
      final List<(String, ArtistType, double, String)> similar = [];
      final Map<int, _Cand> pool = {};
+     List<(String, ArtistType)> simBases = [];
+     int simBaseCursor = 0;
+     int similarCursor = 0;
+     final Set<String> similarNames = {};
      bool built = false;
-     bool similarComputed = false;
      int sourceCount = 0;
      }
      class _TasteRecommendPageState extends State<TasteRecommendPage> {
      static const int _kResultCount = 20;
-     static const int _kProfileArticleLimit = 80;
+     static const int _kMinPages = 15;
      static const int _kRecentLimit = 30;
      static const int _kNetworkFetchLimit = 12;
      static const int _kChunkSize = 300;
      static const int _kKeepPerChunk = 25;
      static const int _kMaxArtistSourcePerDraw = 7;
-     static const int _kMaxSimilarPerDraw = 7;
+     static const int _kMaxSimilarPerDraw = 10;
      static const int _kMaxPerArtist = 2;
-     static const int _kSeenKeep = 400;
+     static const int _kSimilarPerArtist = 10; // 작가 페이지의 비슷한 작가 목록 앞쪽 10명
+     static const int _kSimilarBases = 20;
+     static const int _kSeenKeep = 3000;
      static const String _kSeenKey = 'ai_recommend_seen_ids';
+     static const String _kSeenTitleKey = 'ai_recommend_seen_titles';
      final Random _rand = Random();
      _Mode _mode = _Mode.taste;
      final Map<_Mode, _Profile> _profiles = {
@@ -91,7 +97,16 @@ jobs:
      final List<int> _recentReadIds = [];
      final Set<int> _shownIds = {};
      final List<int> _seenOrder = [];
+     final Set<String> _seenTitles = {};
+     final List<String> _seenTitleOrder = [];
+     final Set<String> _ownTitles = {};
+     Map<int, QueryResult> _bookmarkMetas = {};
+     Map<int, QueryResult> _readMetas = {};
      List<(String, ArtistType)> _favArtists = [];
+     List<(String, int)> _anTags = [];
+     List<(String, int)> _anArtists = [];
+     List<(String, int)> _anLangs = [];
+     int? _anPages;
      Set<String> _excluded = {};
      int _rollCount = 0;
      int? _minId;
@@ -180,6 +195,9 @@ jobs:
      final id = int.tryParse(s);
      if (id != null && _shownIds.add(id)) _seenOrder.add(id);
      }
+     for (final t in prefs.getStringList(_kSeenTitleKey) ?? const <String>[]) {
+     if (_seenTitles.add(t)) _seenTitleOrder.add(t);
+     }
      } catch (_) {}
      }
      Future<void> _saveSeen() async {
@@ -187,11 +205,15 @@ jobs:
      if (_seenOrder.length > _kSeenKeep) {
      _seenOrder.removeRange(0, _seenOrder.length - _kSeenKeep);
      }
+     if (_seenTitleOrder.length > _kSeenKeep) {
+     _seenTitleOrder.removeRange(0, _seenTitleOrder.length - _kSeenKeep);
+     }
      final prefs = await SharedPreferences.getInstance();
      await prefs.setStringList(
      _kSeenKey,
      _seenOrder.map((e) => '$e').toList(),
      );
+     await prefs.setStringList(_kSeenTitleKey, _seenTitleOrder);
      } catch (_) {}
      }
      Future<void> _loadIdRange() async {
@@ -229,7 +251,28 @@ jobs:
      if (id != null && _readIds.add(id)) _recentReadIds.add(id);
      }
      } catch (_) {}
+     _setStatus('북마크 분석 중...');
+     _bookmarkMetas = await _loadMetadata(
+     _bookmarkedIds.toList(),
+     maxNetwork: _kNetworkFetchLimit,
+     );
+     _readMetas = await _loadMetadata(
+     _recentReadIds.take(2000).toList(),
+     maxNetwork: 0,
+     );
+     for (final m in [..._bookmarkMetas.values, ..._readMetas.values]) {
+     final k = _titleKey(m);
+     if (k.isNotEmpty) _ownTitles.add(k);
      }
+     }
+     String _titleKey(QueryResult q) {
+     final raw = '${q.result['Title'] ?? ''}'.toLowerCase();
+     var t = raw.replaceAll(RegExp(r'\[[^\]]*\]|\([^)]*\)|\{[^}]*\}|【[^】]*】'), ' ');
+     t = t.replaceAll(RegExp(r'[^\p{L}\p{N}]+', unicode: true), '');
+     if (t.isEmpty) t = raw.replaceAll(RegExp(r'\s+'), '');
+     return t.isEmpty ? '' : '${_mainArtist(q)}|$t';
+     }
+     int? _pages(QueryResult q) => int.tryParse('${q.result['Files'] ?? ''}');
      void _addTags(_Profile p, QueryResult m, double w) {
      final seen = <String>{};
      for (final (group, name) in _tagsOf(m)) {
@@ -246,28 +289,84 @@ jobs:
      });
      }
      Future<void> _buildTasteProfile(_Profile p) async {
-     _setStatus('북마크 분석 중...');
-     final sample = _bookmarkedIds.toList()..shuffle(_rand);
-     final metas = await _loadMetadata(
-     sample.take(_kProfileArticleLimit).toList(),
-     maxNetwork: _kNetworkFetchLimit,
-     );
+     _setStatus('내 취향 분석 중...');
+     final metas = _bookmarkMetas;
      p.sourceCount = metas.length;
+     final tagCount = <String, int>{};
+     final artistCount = <(String, ArtistType), int>{};
+     final langCount = <String, int>{};
+     final pages = <int>[];
      for (final m in metas.values) {
      _addTags(p, m, 1.0);
+     final seen = <String>{};
+     for (final (group, name) in _tagsOf(m)) {
+     final token = _tokenOf(group, name);
+     if (token.isEmpty || _isExcluded(token) || !seen.add(token)) continue;
+     tagCount[token] = (tagCount[token] ?? 0) + 1;
+     }
+     for (final a in _splitNames(m.artists())) {
+     final k = (a, ArtistType.artist);
+     artistCount[k] = (artistCount[k] ?? 0) + 1;
+     }
+     for (final g in _splitNames(m.groups())) {
+     final k = (g, ArtistType.group);
+     artistCount[k] = (artistCount[k] ?? 0) + 1;
+     }
+     final lang = '${m.result['Language'] ?? ''}'.trim().toLowerCase();
+     if (lang.isNotEmpty && lang != 'n/a') {
+     langCount[lang] = (langCount[lang] ?? 0) + 1;
+     }
+     final pg = _pages(m);
+     if (pg != null && pg > 0) pages.add(pg);
      }
      for (final raw in Settings.favoriteTags.value) {
      final token = _norm(raw);
      if (token.isEmpty || _isExcluded(token)) continue;
      p.weights[token] = (p.weights[token] ?? 0) + 3.0;
      }
-     p.artists = List.of(_favArtists);
+     final total = max(1, metas.length);
+     final tags = tagCount.entries.toList()
+     ..sort((a, b) => b.value.compareTo(a.value));
+     _anTags = [
+     for (final e in tags.take(8)) (e.key, (e.value * 100 / total).round()),
+     ];
+     final arts = artistCount.entries.where((e) => e.value >= 2).toList()
+     ..sort((a, b) => b.value.compareTo(a.value));
+     _anArtists = [for (final e in arts.take(8)) (e.key.$1, e.value)];
+     final langs = langCount.entries.toList()
+     ..sort((a, b) => b.value.compareTo(a.value));
+     _anLangs = [
+     for (final e in langs.take(3)) (e.key, (e.value * 100 / total).round()),
+     ];
+     pages.sort();
+     _anPages = pages.isEmpty ? null : pages[pages.length ~/ 2];
+     final favNames = _favArtists.map((e) => e.$1).toSet();
+     final bmArtists = [
+     for (final e in arts.take(15))
+     if (!favNames.contains(e.key.$1)) e.key,
+     ];
+     p.artists = [..._favArtists, ...bmArtists];
+     final favBases =
+     _favArtists
+     .where((e) => e.$2 == ArtistType.artist || e.$2 == ArtistType.group)
+     .toList()
+     ..shuffle(_rand);
+     p.simBases = [...favBases, ...bmArtists].take(_kSimilarBases).toList();
      _buildVec(p);
      }
      Future<void> _buildRecentProfile(_Profile p) async {
      _setStatus('최근 본 작품 분석 중...');
      final recent = _recentReadIds.take(_kRecentLimit).toList();
-     final metas = await _loadMetadata(recent, maxNetwork: _kNetworkFetchLimit);
+     final metas = <int, QueryResult>{
+     for (final id in recent)
+     if (_readMetas[id] != null) id: _readMetas[id]!,
+     };
+     metas.addAll(
+     await _loadMetadata(
+     recent.where((e) => !metas.containsKey(e)).toList(),
+     maxNetwork: _kNetworkFetchLimit,
+     ),
+     );
      p.sourceCount = metas.length;
      final artistW = <(String, ArtistType), double>{};
      for (var i = 0; i < recent.length; i++) {
@@ -287,6 +386,7 @@ jobs:
      final ranked = artistW.entries.toList()
      ..sort((a, b) => b.value.compareTo(a.value));
      p.artists = ranked.take(10).map((e) => e.key).toList();
+     p.simBases = List.of(p.artists);
      _buildVec(p);
      }
      double _score(_Profile p, QueryResult m) {
@@ -302,6 +402,12 @@ jobs:
      void _addCand(_Profile p, QueryResult q, double bonus, String reason) {
      final id = _idOf(q);
      if (id == null || !_isNew(id) || _hasExcluded(q)) return;
+     final pages = _pages(q);
+     if (pages != null && pages < _kMinPages) return;
+     final tk = _titleKey(q);
+     if (tk.isNotEmpty && (_ownTitles.contains(tk) || _seenTitles.contains(tk))) {
+     return;
+     }
      final score = _score(p, q) + bonus;
      final old = p.pool[id];
      if (old == null || score > old.score) {
@@ -309,9 +415,14 @@ jobs:
      }
      }
      int _available(_Profile p) => p.pool.keys.where(_isNew).length;
-     String _withFilters(String tokens) => translate2query(
+     String _and(String sql, String cond) =>
+     sql.contains('WHERE') ? '$sql AND $cond' : '$sql WHERE $cond';
+     String _withFilters(String tokens) => _and(
+     translate2query(
      '$tokens ${Settings.includeTags.value} ${Settings.serializedExcludeTags}'
      .trim(),
+     ),
+     '(Files IS NULL OR Files >= $_kMinPages)',
      );
      Future<List<QueryResult>> _localQuery(
      String tokens, {
@@ -338,8 +449,7 @@ jobs:
      final span = (_maxId! - _minId!).toDouble();
      for (var i = 0; i < chunks; i++) {
      final before = _maxId! + 1 - (span * pow(_rand.nextDouble(), 2)).toInt();
-     var sql = _withFilters('');
-     sql += sql.contains('WHERE') ? ' AND Id < $before' : ' WHERE Id < $before';
+     final sql = _and(_withFilters(''), 'Id < $before');
      List<QueryResult> rows;
      try {
      rows = await QueryManager.queryPagination(
@@ -437,9 +547,17 @@ jobs:
      ? await _localQuery(_orTokens(use), limit: 60, maxPage: 5)
      : await _networkArtists(use.take(3));
      final names = use.map((e) => e.$1).toList();
-     final label = mode == _Mode.taste ? '즐겨찾는 작가' : '최근 본 작가';
+     final favNames = _favArtists.map((e) => e.$1).toSet();
      for (final q in rows) {
      final who = _matchName(q, names);
+     final String label;
+     if (mode == _Mode.recent) {
+     label = '최근 본 작가';
+     } else if (who != null && !favNames.contains(who)) {
+     label = '자주 북마크한 작가';
+     } else {
+     label = '즐겨찾는 작가';
+     }
      _addCand(
      p,
      q,
@@ -448,16 +566,15 @@ jobs:
      );
      }
      }
-     Future<void> _computeSimilar(_Profile p, _Mode mode) async {
-     if (p.similarComputed) return;
-     p.similarComputed = true;
-     final own = {...p.artists.map((e) => e.$1), ..._favArtists.map((e) => e.$1)};
-     final cand = <String, (ArtistType, double, String)>{};
-     final picks = p.artists
-     .where((e) => e.$2 == ArtistType.artist || e.$2 == ArtistType.group)
-     .toList();
-     if (mode == _Mode.taste) picks.shuffle(_rand);
-     for (final (name, type) in picks.take(4)) {
+     Future<void> _computeSimilarSome(_Profile p, int n) async {
+     final own = {
+     ...p.artists.map((e) => e.$1),
+     ..._favArtists.map((e) => e.$1),
+     };
+     var done = 0;
+     while (done < n && p.simBaseCursor < p.simBases.length) {
+     final (name, type) = p.simBases[p.simBaseCursor++];
+     done++;
      await Future<void>.delayed(Duration.zero);
      final isGroup = type == ArtistType.group;
      List<(String, double)> sims = [];
@@ -466,50 +583,47 @@ jobs:
      ? HentaiIndex.calculateSimilarGroups(name)
      : HentaiIndex.calculateSimilarArtists(name);
      } catch (_) {}
-     final vecs = isGroup ? HentaiIndex.tagGroup : HentaiIndex.tagArtist;
-     for (final (other, baseSim) in sims.take(12)) {
+     for (final (other, baseSim) in sims.take(_kSimilarPerArtist)) {
      if (own.contains(other) ||
-     cand.containsKey(other) ||
-     !_safeName(other)) {
+     !_safeName(other) ||
+     !p.similarNames.add(other)) {
      continue;
      }
-     var rank = baseSim;
-     final vec = vecs[other];
-     if (p.vec.isNotEmpty && vec is Map<String, dynamic>) {
-     rank = Distance.cosineDistance(p.vec, vec);
-     }
-     cand[other] = (type, rank, name);
+     p.similar.add((other, type, baseSim, name));
      }
      }
-     final ranked = cand.entries.where((e) => e.value.$2 > 0).toList()
-     ..sort((a, b) => b.value.$2.compareTo(a.value.$2));
-     p.similar
-     ..clear()
-     ..addAll(
-     ranked
-     .take(10)
-     .map((e) => (e.key, e.value.$1, e.value.$2, e.value.$3)),
-     );
      }
      Future<void> _fillSimilar(_Profile p, _Mode mode) async {
-     await _computeSimilar(p, mode);
+     await _computeSimilarSome(p, 5);
      if (p.similar.isEmpty) return;
-     final pick = (List.of(p.similar)..shuffle(_rand)).take(8).toList();
+     final pick = <(String, ArtistType, double, String)>[];
+     for (var i = 0; i < 12 && i < p.similar.length; i++) {
+     pick.add(p.similar[p.similarCursor % p.similar.length]);
+     p.similarCursor++;
+     }
      final pairs = pick.map((e) => (e.$1, e.$2));
      final rows = _hasDb
-     ? await _localQuery(_orTokens(pairs), limit: 60, maxPage: 5)
-     : await _networkArtists(pairs.take(3));
+     ? await _localQuery(_orTokens(pairs), limit: 150, maxPage: 3)
+     : await _networkArtists(pairs.take(4));
      final names = pick.map((e) => e.$1).toList();
+     final byArtist = <String, List<(QueryResult, double)>>{};
      for (final q in rows) {
      final who = _matchName(q, names);
      if (who == null) continue;
-     final info = pick.firstWhere((e) => e.$1 == who);
+     byArtist.putIfAbsent(who, () => []).add((q, _score(p, q)));
+     }
+     for (final e in byArtist.entries) {
+     final info = pick.firstWhere((x) => x.$1 == e.key);
+     final list = e.value..sort((a, b) => b.$2.compareTo(a.$2));
+     final good = list.where((x) => x.$2 > 0).take(4).toList();
+     for (final (q, _) in good.isEmpty ? list.take(1) : good) {
      _addCand(
      p,
      q,
-     1.0 + info.$3 / 100 * 2.0,
-     '비슷한 작가: $who (${info.$4} 기준)',
+     2.5 + info.$3 / 100 * 2.0,
+     '비슷한 작가: ${e.key} (${info.$4} 기준)',
      );
+     }
      }
      }
      Future<void> _backgroundFill(_Mode mode) async {
@@ -517,10 +631,10 @@ jobs:
      final p = _profiles[mode]!;
      if (mounted) setState(() {});
      try {
+     await _fillSimilar(p, mode);
+     await _fillArtists(p, mode);
      await _fillTags(p, mode, 3);
      await _quickFill(p, mode, 4);
-     await _fillArtists(p, mode);
-     await _fillSimilar(p, mode);
      } catch (_) {
      } finally {
      _fillingModes.remove(mode);
@@ -539,22 +653,24 @@ jobs:
      }) async {
      final out = <int, QueryResult>{};
      if (ids.isEmpty) return out;
+     for (var i = 0; i < ids.length; i += 400) {
      try {
      final local = await QueryManager.queryIds(
-     ids,
-     ).timeout(const Duration(seconds: 8));
+     ids.sublist(i, min(i + 400, ids.length)),
+     ).timeout(const Duration(seconds: 10));
      for (final q in local) {
      final id = _idOf(q);
      if (id != null) out[id] = q;
      }
      } catch (_) {}
+     }
      var rest = ids.where((e) => !out.containsKey(e)).toList();
-     if (rest.isNotEmpty) {
+     for (var i = 0; i < rest.length; i += 400) {
      try {
      out.addAll(
      await HybridLoader.getCachedMetadataBatch(
-     rest,
-     ).timeout(const Duration(seconds: 8)),
+     rest.sublist(i, min(i + 400, rest.length)),
+     ).timeout(const Duration(seconds: 10)),
      );
      } catch (_) {}
      }
@@ -657,18 +773,23 @@ jobs:
      .toList()
      ..sort((a, b) => b.$2.compareTo(a.$2));
      final picked = <_Cand>[];
+     final pickedTitles = <String>{};
      final perArtist = <String, int>{};
      var art = 0;
      var sim = 0;
      for (final (c, _) in keyed) {
      if (picked.length >= _kResultCount) break;
      final isArt =
-     c.reason.startsWith('즐겨찾는') || c.reason.startsWith('최근 본 작가');
+     c.reason.startsWith('즐겨찾는') ||
+     c.reason.startsWith('자주 북마크한') ||
+     c.reason.startsWith('최근 본 작가');
      final isSim = c.reason.startsWith('비슷한');
      if (isArt && art >= _kMaxArtistSourcePerDraw) continue;
      if (isSim && sim >= _kMaxSimilarPerDraw) continue;
      final who = _mainArtist(c.q);
      if (who.isNotEmpty && (perArtist[who] ?? 0) >= _kMaxPerArtist) continue;
+     final tk = _titleKey(c.q);
+     if (tk.isNotEmpty && !pickedTitles.add(tk)) continue;
      if (who.isNotEmpty) perArtist[who] = (perArtist[who] ?? 0) + 1;
      if (isArt) art++;
      if (isSim) sim++;
@@ -678,6 +799,9 @@ jobs:
      _shownIds.add(c.id);
      _seenOrder.add(c.id);
      p.pool.remove(c.id);
+     }
+     for (final t in pickedTitles) {
+     if (_seenTitles.add(t)) _seenTitleOrder.add(t);
      }
      _saveSeen();
      _rollCount++;
@@ -709,11 +833,22 @@ jobs:
      () => _hasDb ? _quickFill(p, mode, 5) : _fillTags(p, mode, 2),
      );
      await _step('작가 작품 더 찾는 중...', () => _fillArtists(p, mode));
+     await _step('비슷한 작가 작품 더 찾는 중...', () => _fillSimilar(p, mode));
      if (!mounted || _mode != mode) return;
      }
      if (_available(p) < 70) _backgroundFill(mode);
      _draw();
      }
+     String _langKo(String lang) =>
+     const {
+     'korean': '한국어',
+     'japanese': '일본어',
+     'english': '영어',
+     'chinese': '중국어',
+     'spanish': '스페인어',
+     'russian': '러시아어',
+     }[lang] ??
+     lang;
      List<String> _topTokens(_Profile p, int n) {
      final entries = p.weights.entries.toList()
      ..sort((a, b) => b.value.compareTo(a.value));
@@ -818,14 +953,48 @@ jobs:
      Text('다음 추천에 쓸 작품을 미리 모으는 중...', style: hint),
      ],
      const SizedBox(height: 6),
+     if (_mode == _Mode.taste) ...[
+     Text(
+     '내 취향 분석',
+     style: hint.copyWith(fontWeight: FontWeight.w700),
+     ),
+     const SizedBox(height: 4),
+     Text(
+     '· 북마크 ${p.sourceCount}개, 즐겨찾기 태그 $favTagCount개, '
+     '즐겨찾는 작가 ${_favArtists.length}명을 분석했어요.',
+     style: hint,
+     ),
+     if (_anTags.isNotEmpty)
+     Text(
+     '· 좋아하는 태그: '
+     '${_anTags.take(6).map((e) => '${e.$1} ${e.$2}%').join(', ')}',
+     style: hint,
+     ),
+     if (_anArtists.isNotEmpty)
+     Text(
+     '· 자주 북마크한 작가: '
+     '${_anArtists.take(5).map((e) => '${e.$1}(${e.$2})').join(', ')}',
+     style: hint,
+     ),
+     if (_anLangs.isNotEmpty)
+     Text(
+     '· 주로 보는 언어: '
+     '${_anLangs.map((e) => '${_langKo(e.$1)} ${e.$2}%').join(', ')}',
+     style: hint,
+     ),
+     if (_anPages != null)
+     Text('· 보통 $_anPages쪽 정도 되는 작품을 봐요.', style: hint),
+     ] else ...[
      Text(summary, style: hint),
      const SizedBox(height: 4),
      Text('자주 나온 태그: ${_topTokens(p, 8).join(', ')}', style: hint),
+     ],
      if (p.similar.isNotEmpty) ...[
      const SizedBox(height: 4),
      Text(
-     '취향이 비슷한 작가: '
-     '${p.similar.take(5).map((e) => e.$1).join(', ')}',
+     '· 비슷한 작가 목록에서 찾는 작가: '
+     '${p.similar.take(5).map((e) => e.$1).join(', ')}'
+     '${p.similar.length > 5 ? ' 외 ${p.similar.length - 5}명' : ''}',
      style: hint,
      ),
      ],
@@ -943,6 +1112,7 @@ jobs:
     run: |
      mkdir -p lib/pages/viewer/translate
      cp ../mods/tr.txt lib/pages/viewer/translate/manga_translate.dart
+     grep -q "dart:typed_data" lib/pages/viewer/translate/manga_translate.dart || sed -i "1i import 'dart:typed_data';" lib/pages/viewer/translate/manga_translate.dart
      python3 - <<'PY'
      import sys
 
