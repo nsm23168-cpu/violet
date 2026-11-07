@@ -36,6 +36,7 @@ jobs:
      import 'package:violet/database/user/bookmark.dart';
      import 'package:violet/database/user/record.dart';
      import 'package:violet/model/article_list_item.dart';
+     import 'package:violet/pages/common/utils.dart';
      import 'package:violet/settings/settings.dart';
      import 'package:violet/widgets/article_item/article_list_item_widget.dart';
      class TasteRecommendPage extends StatefulWidget {
@@ -102,6 +103,8 @@ jobs:
      final Set<String> _ownTitles = {};
      Map<int, QueryResult> _bookmarkMetas = {};
      Map<int, QueryResult> _readMetas = {};
+     final Map<int, int> _pageCache = {};
+     bool _drawing = false;
      List<(String, ArtistType)> _favArtists = [];
      List<(String, int)> _anTags = [];
      List<(String, int)> _anArtists = [];
@@ -402,8 +405,10 @@ jobs:
      void _addCand(_Profile p, QueryResult q, double bonus, String reason) {
      final id = _idOf(q);
      if (id == null || !_isNew(id) || _hasExcluded(q)) return;
-     final pages = _pages(q);
-     if (pages != null && pages < _kMinPages) return;
+     final pages = _pages(q) ?? 0;
+     if (pages > 0 && pages < _kMinPages) return;
+     final checked = _pageCache[id] ?? 0;
+     if (checked > 0 && checked < _kMinPages) return;
      final tk = _titleKey(q);
      if (tk.isNotEmpty && (_ownTitles.contains(tk) || _seenTitles.contains(tk))) {
      return;
@@ -415,6 +420,37 @@ jobs:
      }
      }
      int _available(_Profile p) => p.pool.keys.where(_isNew).length;
+     int? _knownPages(_Cand c) {
+     final pg = _pages(c.q) ?? 0;
+     if (pg > 0) return pg;
+     return _pageCache[c.id];
+     }
+     Future<void> _verifyPages(List<_Cand> list) async {
+     final unknown = list.where((c) => _knownPages(c) == null).toList();
+     for (var i = 0; i < unknown.length; i += 6) {
+     final chunk = unknown.skip(i).take(6).toList();
+     await Future.wait(
+     chunk.map((c) async {
+     try {
+     final provider = await getImageProvider(
+     c.q,
+     ).timeout(const Duration(seconds: 8));
+     _pageCache[c.id] = provider.length();
+     } catch (_) {
+     _pageCache[c.id] = -1;
+     }
+     }),
+     );
+     }
+     }
+     List<_Cand> _unknownTop(_Profile p, int n) {
+     final list =
+     p.pool.values
+     .where((c) => _isNew(c.id) && _knownPages(c) == null)
+     .toList()
+     ..sort((a, b) => b.score.compareTo(a.score));
+     return list.take(n).toList();
+     }
      String _and(String sql, String cond) =>
      sql.contains('WHERE') ? '$sql AND $cond' : '$sql WHERE $cond';
      String _withFilters(String tokens) => _and(
@@ -422,7 +458,7 @@ jobs:
      '$tokens ${Settings.includeTags.value} ${Settings.serializedExcludeTags}'
      .trim(),
      ),
-     '(Files IS NULL OR Files >= $_kMinPages)',
+     '(Files IS NULL OR Files <= 0 OR Files >= $_kMinPages)',
      );
      Future<List<QueryResult>> _localQuery(
      String tokens, {
@@ -635,6 +671,7 @@ jobs:
      await _fillArtists(p, mode);
      await _fillTags(p, mode, 3);
      await _quickFill(p, mode, 4);
+     await _verifyPages(_unknownTop(p, 60));
      } catch (_) {
      } finally {
      _fillingModes.remove(mode);
@@ -757,10 +794,20 @@ jobs:
      }
      if (!mounted || _mode != mode) return;
      _backgroundFill(mode);
-     _draw();
+     await _draw();
      }
-     void _draw() {
+     Future<void> _draw() async {
+     if (_drawing) return;
+     _drawing = true;
+     try {
+     await _drawInner();
+     } finally {
+     _drawing = false;
+     }
+     }
+     Future<void> _drawInner() async {
      final p = _p;
+     final mode = _mode;
      final keyed =
      p.pool.values
      .where((c) => _isNew(c.id))
@@ -772,6 +819,12 @@ jobs:
      )
      .toList()
      ..sort((a, b) => b.$2.compareTo(a.$2));
+     final head = keyed.take(_kResultCount + 15).map((e) => e.$1).toList();
+     if (head.any((c) => _knownPages(c) == null)) {
+     if (_results.isEmpty) _setStatus('작품 페이지 수 확인 중...');
+     await _verifyPages(head);
+     if (!mounted || _mode != mode) return;
+     }
      final picked = <_Cand>[];
      final pickedTitles = <String>{};
      final perArtist = <String, int>{};
@@ -779,6 +832,11 @@ jobs:
      var sim = 0;
      for (final (c, _) in keyed) {
      if (picked.length >= _kResultCount) break;
+     final pg = _knownPages(c) ?? 0;
+     if (pg > 0 && pg < _kMinPages) {
+     p.pool.remove(c.id);
+     continue;
+     }
      final isArt =
      c.reason.startsWith('즐겨찾는') ||
      c.reason.startsWith('자주 북마크한') ||
@@ -837,7 +895,7 @@ jobs:
      if (!mounted || _mode != mode) return;
      }
      if (_available(p) < 70) _backgroundFill(mode);
-     _draw();
+     await _draw();
      }
      String _langKo(String lang) =>
      const {
