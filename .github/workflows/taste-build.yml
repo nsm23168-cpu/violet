@@ -23,6 +23,7 @@ jobs:
     if: steps.chk.outputs.ok == '1'
     run: |
      cat > lib/pages/bookmark/taste_recommend_page.dart <<'DART'
+     import 'dart:convert';
      import 'dart:math';
      import 'package:flutter/material.dart';
      import 'package:provider/provider.dart';
@@ -54,13 +55,14 @@ jobs:
      }
      class _Profile {
      final Map<String, double> weights = {};
+     double norm = 0;
      final Map<String, dynamic> vec = {};
      List<(String, ArtistType)> artists = [];
      final List<(String, ArtistType, double, String)> similar = [];
      final Map<int, _Cand> pool = {};
      List<(String, ArtistType)> simBases = [];
      int simBaseCursor = 0;
-     int similarCursor = 0;
+     final Set<String> usedSimilar = {};
      final Set<String> similarNames = {};
      bool built = false;
      int sourceCount = 0;
@@ -80,6 +82,11 @@ jobs:
      static const int _kSeenKeep = 3000;
      static const String _kSeenKey = 'ai_recommend_seen_ids';
      static const String _kSeenTitleKey = 'ai_recommend_seen_titles';
+     static const String _kSimCacheKey = 'ai_similar_cache_v2';
+     static const String _kPageCacheKey = 'ai_page_cache_v1';
+     static const int _kTasteTokens = 80;
+     static const double _kMinMatch = 0.2; // 비슷한 작가가 내 취향과 이만큼은 맞아야 해요
+     static const double _kMinWorkScore = 0.12; // 작품이 내 취향과 이만큼은 맞아야 해요
      final Random _rand = Random();
      _Mode _mode = _Mode.taste;
      final Map<_Mode, _Profile> _profiles = {
@@ -107,6 +114,10 @@ jobs:
      bool _drawing = false;
      List<(String, ArtistType)> _favArtists = [];
      List<(String, int)> _anTags = [];
+     List<String> _anFavTags = [];
+     final Map<String, List<(String, double)>> _simCache = {};
+     final Map<String, String> _idxToToken = {};
+     double _maxTagCount = 0;
      List<(String, int)> _anArtists = [];
      List<(String, int)> _anLangs = [];
      int? _anPages;
@@ -135,7 +146,9 @@ jobs:
      try {
      _setStatus('기록 불러오는 중...');
      await _loadSeen();
+     await _loadCaches();
      await _loadIdRange();
+     await _loadTagStats();
      await _loadBase();
      } catch (e) {
      if (!mounted) return;
@@ -202,6 +215,109 @@ jobs:
      if (_seenTitles.add(t)) _seenTitleOrder.add(t);
      }
      } catch (_) {}
+     }
+     Future<void> _loadCaches() async {
+     try {
+     final prefs = await SharedPreferences.getInstance();
+     final raw = prefs.getString(_kSimCacheKey);
+     if (raw != null) {
+     final m = jsonDecode(raw) as Map<String, dynamic>;
+     m.forEach((base, list) {
+     _simCache[base] = [
+     for (final e in list as List)
+     ('${(e as List)[0]}', (e[1] as num).toDouble()),
+     ];
+     });
+     }
+     for (final s in prefs.getStringList(_kPageCacheKey) ?? const <String>[]) {
+     final i = s.indexOf(':');
+     if (i <= 0) continue;
+     final id = int.tryParse(s.substring(0, i));
+     final pg = int.tryParse(s.substring(i + 1));
+     if (id != null && pg != null) _pageCache[id] = pg;
+     }
+     } catch (_) {}
+     }
+     Future<void> _saveCaches() async {
+     try {
+     final prefs = await SharedPreferences.getInstance();
+     final sim = <String, dynamic>{
+     for (final e in _simCache.entries)
+     e.key: [
+     for (final (n, v) in e.value) [n, v],
+     ],
+     };
+     await prefs.setString(_kSimCacheKey, jsonEncode(sim));
+     final pages = _pageCache.entries.where((e) => e.value > 0).toList();
+     final keep = pages.length > 6000 ? pages.sublist(pages.length - 6000) : pages;
+     await prefs.setStringList(_kPageCacheKey, [
+     for (final e in keep) '${e.key}:${e.value}',
+     ]);
+     } catch (_) {}
+     }
+     Future<void> _loadTagStats() async {
+     try {
+     await HentaiIndex.loadCountMapIfRequired().timeout(
+     const Duration(seconds: 10),
+     );
+     } catch (_) {}
+     final tc = HentaiIndex.tagCount;
+     if (tc != null) {
+     for (final g in ['female', 'male', 'tag']) {
+     final m = tc[g];
+     if (m is Map) {
+     for (final v in m.values) {
+     if (v is num && v > _maxTagCount) _maxTagCount = v.toDouble();
+     }
+     }
+     }
+     }
+     HentaiIndex.tagIndex.forEach((tag, idx) {
+     _idxToToken['$idx'] = _norm(tag);
+     });
+     }
+     double _idf(String token) {
+     if (_maxTagCount <= 0) return 1.0;
+     final tc = HentaiIndex.tagCount;
+     final i = token.indexOf(':');
+     final group = i >= 0 ? token.substring(0, i) : 'tag';
+     final name = (i >= 0 ? token.substring(i + 1) : token).replaceAll('_', ' ');
+     final m = tc?[group];
+     final c = (m is Map && m[name] is num) ? (m[name] as num).toDouble() : 0.0;
+     return log(1 + _maxTagCount / (1 + c));
+     }
+     Map<String, double> _artistShare(String name, ArtistType type) {
+     final v = (type == ArtistType.group
+     ? HentaiIndex.tagGroup
+     : HentaiIndex.tagArtist)[name];
+     if (v is! Map) return const {};
+     var top = 0.0;
+     v.forEach((k, c) {
+     if (c is num && c > top) top = c.toDouble();
+     });
+     if (top <= 0) return const {};
+     final out = <String, double>{};
+     v.forEach((k, c) {
+     final tok = _idxToToken['$k'];
+     if (tok != null && c is num && !_isExcluded(tok)) out[tok] = c / top;
+     });
+     return out;
+     }
+     void _finishWeights(_Profile p, Map<String, double> raw) {
+     final scored = <(String, double)>[
+     for (final e in raw.entries)
+     if (e.value > 0) (e.key, e.value * _idf(e.key)),
+     ]..sort((a, b) => b.$2.compareTo(a.$2));
+     p.weights.clear();
+     final top = scored.isEmpty ? 1.0 : scored.first.$2;
+     for (final (t, w) in scored.take(_kTasteTokens)) {
+     p.weights[t] = w / top;
+     }
+     var n = 0.0;
+     for (final w in p.weights.values) {
+     n += w * w;
+     }
+     p.norm = sqrt(n);
      }
      Future<void> _saveSeen() async {
      try {
@@ -276,14 +392,6 @@ jobs:
      return t.isEmpty ? '' : '${_mainArtist(q)}|$t';
      }
      int? _pages(QueryResult q) => int.tryParse('${q.result['Files'] ?? ''}');
-     void _addTags(_Profile p, QueryResult m, double w) {
-     final seen = <String>{};
-     for (final (group, name) in _tagsOf(m)) {
-     final token = _tokenOf(group, name);
-     if (token.isEmpty || _isExcluded(token) || !seen.add(token)) continue;
-     p.weights[token] = (p.weights[token] ?? 0) + w;
-     }
-     }
      void _buildVec(_Profile p) {
      p.vec.clear();
      p.weights.forEach((token, w) {
@@ -300,7 +408,6 @@ jobs:
      final langCount = <String, int>{};
      final pages = <int>[];
      for (final m in metas.values) {
-     _addTags(p, m, 1.0);
      final seen = <String>{};
      for (final (group, name) in _tagsOf(m)) {
      final token = _tokenOf(group, name);
@@ -319,20 +426,37 @@ jobs:
      if (lang.isNotEmpty && lang != 'n/a') {
      langCount[lang] = (langCount[lang] ?? 0) + 1;
      }
-     final pg = _pages(m);
-     if (pg != null && pg > 0) pages.add(pg);
-     }
-     for (final raw in Settings.favoriteTags.value) {
-     final token = _norm(raw);
-     if (token.isEmpty || _isExcluded(token)) continue;
-     p.weights[token] = (p.weights[token] ?? 0) + 3.0;
+     final pg = _pages(m) ?? 0;
+     if (pg > 0) pages.add(pg);
      }
      final total = max(1, metas.length);
-     final tags = tagCount.entries.toList()
-     ..sort((a, b) => b.value.compareTo(a.value));
+     final favShare = <String, double>{};
+     var favN = 0;
+     for (final (name, type) in _favArtists.take(40)) {
+     if (type != ArtistType.artist && type != ArtistType.group) continue;
+     final share = _artistShare(name, type);
+     if (share.isEmpty) continue;
+     favN++;
+     share.forEach((t, v) => favShare[t] = (favShare[t] ?? 0) + v);
+     }
+     if (favN > 0) favShare.updateAll((t, v) => v / favN);
+     final favTags = {
+     for (final ft in Settings.favoriteTags.value) _norm(ft),
+     }..removeWhere((t) => t.isEmpty || _isExcluded(t));
+     final raw = <String, double>{};
+     tagCount.forEach((t, c) => raw[t] = c / total);
+     favShare.forEach((t, v) => raw[t] = (raw[t] ?? 0) + 0.6 * v);
+     for (final t in favTags) {
+     raw[t] = (raw[t] ?? 0) + 0.8;
+     }
+     _finishWeights(p, raw);
      _anTags = [
-     for (final e in tags.take(8)) (e.key, (e.value * 100 / total).round()),
+     for (final t in p.weights.keys.take(8))
+     (t, ((tagCount[t] ?? 0) * 100 / total).round()),
      ];
+     final favTop = favShare.entries.toList()
+     ..sort((a, b) => (b.value * _idf(b.key)).compareTo(a.value * _idf(a.key)));
+     _anFavTags = favTop.take(6).map((e) => e.key).toList();
      final arts = artistCount.entries.where((e) => e.value >= 2).toList()
      ..sort((a, b) => b.value.compareTo(a.value));
      _anArtists = [for (final e in arts.take(8)) (e.key.$1, e.value)];
@@ -372,11 +496,17 @@ jobs:
      );
      p.sourceCount = metas.length;
      final artistW = <(String, ArtistType), double>{};
+     final raw = <String, double>{};
      for (var i = 0; i < recent.length; i++) {
      final m = metas[recent[i]];
      if (m == null) continue;
      final w = 1.0 / (1.0 + i / 8.0); // 최근에 본 것일수록 크게
-     _addTags(p, m, w);
+     final seen = <String>{};
+     for (final (group, name) in _tagsOf(m)) {
+     final token = _tokenOf(group, name);
+     if (token.isEmpty || _isExcluded(token) || !seen.add(token)) continue;
+     raw[token] = (raw[token] ?? 0) + w;
+     }
      for (final a in _splitNames(m.artists())) {
      final k = (a, ArtistType.artist);
      artistW[k] = (artistW[k] ?? 0) + w;
@@ -388,19 +518,22 @@ jobs:
      }
      final ranked = artistW.entries.toList()
      ..sort((a, b) => b.value.compareTo(a.value));
+     _finishWeights(p, raw);
      p.artists = ranked.take(10).map((e) => e.key).toList();
      p.simBases = List.of(p.artists);
      _buildVec(p);
      }
      double _score(_Profile p, QueryResult m) {
      final tags = _tagsOf(m);
-     if (tags.isEmpty) return 0;
+     if (tags.isEmpty || p.norm <= 0) return 0;
      var s = 0.0;
+     final seen = <String>{};
      for (final (group, name) in tags) {
-     final w = p.weights[_tokenOf(group, name)];
-     if (w != null) s += sqrt(w);
+     final t = _tokenOf(group, name);
+     if (!seen.add(t)) continue;
+     s += p.weights[t] ?? 0;
      }
-     return s / sqrt(tags.length);
+     return s / (sqrt(seen.length) * p.norm);
      }
      void _addCand(_Profile p, QueryResult q, double bonus, String reason) {
      final id = _idOf(q);
@@ -427,14 +560,15 @@ jobs:
      }
      Future<void> _verifyPages(List<_Cand> list) async {
      final unknown = list.where((c) => _knownPages(c) == null).toList();
-     for (var i = 0; i < unknown.length; i += 6) {
-     final chunk = unknown.skip(i).take(6).toList();
+     if (unknown.isEmpty) return;
+     for (var i = 0; i < unknown.length; i += 10) {
+     final chunk = unknown.skip(i).take(10).toList();
      await Future.wait(
      chunk.map((c) async {
      try {
      final provider = await getImageProvider(
      c.q,
-     ).timeout(const Duration(seconds: 8));
+     ).timeout(const Duration(seconds: 5));
      _pageCache[c.id] = provider.length();
      } catch (_) {
      _pageCache[c.id] = -1;
@@ -442,6 +576,7 @@ jobs:
      }),
      );
      }
+     _saveCaches();
      }
      List<_Cand> _unknownTop(_Profile p, int n) {
      final list =
@@ -525,7 +660,7 @@ jobs:
      if (!tried.add(token)) continue;
      if (_hasDb) {
      for (final q in await _localQuery(token, limit: 30, maxPage: 15)) {
-     _addCand(p, q, 0.5, '${_tagLabel(mode)}: $token');
+     _addCand(p, q, 0.1, '${_tagLabel(mode)}: $token');
      }
      } else {
      final ids = await _fetchIds(token);
@@ -535,7 +670,7 @@ jobs:
      maxNetwork: 12,
      );
      for (final q in metas.values) {
-     _addCand(p, q, 0.5, '${_tagLabel(mode)}: $token');
+     _addCand(p, q, 0.1, '${_tagLabel(mode)}: $token');
      }
      }
      }
@@ -597,7 +732,7 @@ jobs:
      _addCand(
      p,
      q,
-     mode == _Mode.taste ? 3.0 : 2.0,
+     label == '즐겨찾는 작가' ? 0.6 : 0.45,
      who == null ? label : '$label: $who',
      );
      }
@@ -608,35 +743,60 @@ jobs:
      ..._favArtists.map((e) => e.$1),
      };
      var done = 0;
+     var computed = false;
      while (done < n && p.simBaseCursor < p.simBases.length) {
      final (name, type) = p.simBases[p.simBaseCursor++];
      done++;
-     await Future<void>.delayed(Duration.zero);
      final isGroup = type == ArtistType.group;
-     List<(String, double)> sims = [];
+     final key = '${type.name}:$name';
+     var sims = _simCache[key];
+     if (sims == null) {
+     await Future<void>.delayed(Duration.zero);
      try {
-     sims = isGroup
+     sims = (isGroup
      ? HentaiIndex.calculateSimilarGroups(name)
-     : HentaiIndex.calculateSimilarArtists(name);
-     } catch (_) {}
-     for (final (other, baseSim) in sims.take(_kSimilarPerArtist)) {
+     : HentaiIndex.calculateSimilarArtists(name))
+     .take(_kSimilarPerArtist)
+     .toList();
+     } catch (_) {
+     sims = [];
+     }
+     _simCache[key] = sims;
+     computed = true;
+     }
+     final vecs = isGroup ? HentaiIndex.tagGroup : HentaiIndex.tagArtist;
+     final found = <(String, ArtistType, double, String)>[];
+     for (final (other, _) in sims) {
      if (own.contains(other) ||
      !_safeName(other) ||
-     !p.similarNames.add(other)) {
+     p.similarNames.contains(other)) {
      continue;
      }
-     p.similar.add((other, type, baseSim, name));
+     final vec = vecs[other];
+     final match = (p.vec.isNotEmpty && vec is Map<String, dynamic>)
+     ? Distance.cosineDistance(p.vec, vec)
+     : 0.0;
+     found.add((other, type, match, name));
+     }
+     found.sort((a, b) => b.$3.compareTo(a.$3));
+     var kept = found.where((e) => e.$3 >= _kMinMatch).toList();
+     if (kept.isEmpty) kept = found.take(2).toList();
+     for (final e in kept) {
+     if (p.similarNames.add(e.$1)) p.similar.add(e);
      }
      }
+     p.similar.sort((a, b) => b.$3.compareTo(a.$3));
+     if (computed) _saveCaches();
      }
      Future<void> _fillSimilar(_Profile p, _Mode mode) async {
      await _computeSimilarSome(p, 5);
      if (p.similar.isEmpty) return;
-     final pick = <(String, ArtistType, double, String)>[];
-     for (var i = 0; i < 12 && i < p.similar.length; i++) {
-     pick.add(p.similar[p.similarCursor % p.similar.length]);
-     p.similarCursor++;
+     var pick = p.similar.where((e) => !p.usedSimilar.contains(e.$1)).take(12).toList();
+     if (pick.isEmpty) {
+     p.usedSimilar.clear();
+     pick = p.similar.take(12).toList();
      }
+     p.usedSimilar.addAll(pick.map((e) => e.$1));
      final pairs = pick.map((e) => (e.$1, e.$2));
      final rows = _hasDb
      ? await _localQuery(_orTokens(pairs), limit: 150, maxPage: 3)
@@ -651,13 +811,12 @@ jobs:
      for (final e in byArtist.entries) {
      final info = pick.firstWhere((x) => x.$1 == e.key);
      final list = e.value..sort((a, b) => b.$2.compareTo(a.$2));
-     final good = list.where((x) => x.$2 > 0).take(4).toList();
-     for (final (q, _) in good.isEmpty ? list.take(1) : good) {
+     for (final (q, _) in list.where((x) => x.$2 >= _kMinWorkScore).take(4)) {
      _addCand(
      p,
      q,
-     2.5 + info.$3 / 100 * 2.0,
-     '비슷한 작가: ${e.key} (${info.$4} 기준)',
+     0.3 + 0.5 * info.$3,
+     '비슷한 작가: ${e.key} (${info.$4} 기준, 취향 ${(info.$3 * 100).round()}%)',
      );
      }
      }
@@ -782,15 +941,13 @@ jobs:
      return;
      }
      if (_available(p) < _kResultCount) {
-     await _step(
-     '취향에 맞는 작품 찾는 중...',
-     () => _hasDb ? _quickFill(p, mode, 3) : _fillTags(p, mode, 3),
-     );
-     await _step(
-     mode == _Mode.taste ? '즐겨찾는 작가 작품 찾는 중...' : '최근 본 작가 작품 찾는 중...',
-     () => _fillArtists(p, mode),
-     );
-     await _step('비슷한 작가 찾는 중...', () => _fillSimilar(p, mode));
+     await _step('취향에 맞는 작품 찾는 중...', () async {
+     await Future.wait([
+     _hasDb ? _quickFill(p, mode, 3) : _fillTags(p, mode, 3),
+     _fillArtists(p, mode),
+     _fillSimilar(p, mode),
+     ]);
+     });
      }
      if (!mounted || _mode != mode) return;
      _backgroundFill(mode);
@@ -819,7 +976,7 @@ jobs:
      )
      .toList()
      ..sort((a, b) => b.$2.compareTo(a.$2));
-     final head = keyed.take(_kResultCount + 15).map((e) => e.$1).toList();
+     final head = keyed.take(_kResultCount + 8).map((e) => e.$1).toList();
      if (head.any((c) => _knownPages(c) == null)) {
      if (_results.isEmpty) _setStatus('작품 페이지 수 확인 중...');
      await _verifyPages(head);
@@ -886,12 +1043,13 @@ jobs:
      _loading = true;
      _results = [];
      });
-     await _step(
-     '작품 더 찾는 중...',
-     () => _hasDb ? _quickFill(p, mode, 5) : _fillTags(p, mode, 2),
-     );
-     await _step('작가 작품 더 찾는 중...', () => _fillArtists(p, mode));
-     await _step('비슷한 작가 작품 더 찾는 중...', () => _fillSimilar(p, mode));
+     await _step('작품 더 찾는 중...', () async {
+     await Future.wait([
+     _hasDb ? _quickFill(p, mode, 5) : _fillTags(p, mode, 2),
+     _fillArtists(p, mode),
+     _fillSimilar(p, mode),
+     ]);
+     });
      if (!mounted || _mode != mode) return;
      }
      if (_available(p) < 70) _backgroundFill(mode);
@@ -1024,8 +1182,13 @@ jobs:
      ),
      if (_anTags.isNotEmpty)
      Text(
-     '· 좋아하는 태그: '
-     '${_anTags.take(6).map((e) => '${e.$1} ${e.$2}%').join(', ')}',
+     '· 특히 좋아하는 태그: '
+     '${_anTags.take(6).map((e) => e.$2 > 0 ? '${e.$1} ${e.$2}%' : e.$1).join(', ')}',
+     style: hint,
+     ),
+     if (_anFavTags.isNotEmpty)
+     Text(
+     '· 즐겨찾는 작가들의 공통 태그: ${_anFavTags.join(', ')}',
      style: hint,
      ),
      if (_anArtists.isNotEmpty)
@@ -1050,8 +1213,8 @@ jobs:
      if (p.similar.isNotEmpty) ...[
      const SizedBox(height: 4),
      Text(
-     '· 비슷한 작가 목록에서 찾는 작가: '
-     '${p.similar.take(5).map((e) => e.$1).join(', ')}'
+     '· 내 취향과 맞는 비슷한 작가: '
+     '${p.similar.take(5).map((e) => '${e.$1} ${(e.$3 * 100).round()}%').join(', ')}'
      '${p.similar.length > 5 ? ' 외 ${p.similar.length - 5}명' : ''}',
      style: hint,
      ),
