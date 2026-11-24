@@ -12,13 +12,34 @@ jobs:
    contents: write
   defaults:
    run:
-    working-directory: violet
+    working-directory: up/violet
   steps:
   - uses: actions/checkout@v4
+    with:
+     sparse-checkout: mods
   - name: Check files
     id: chk
+    working-directory: ${{ github.workspace }}
     run: |
-     if [ -s ../mods/tr.txt ]; then echo "ok=1" >> "$GITHUB_OUTPUT"; else echo "mods/tr.txt 가 아직 없어서 빌드는 건너뛰어요"; fi
+     if [ -s mods/tr.txt ]; then echo "ok=1" >> "$GITHUB_OUTPUT"; else echo "mods/tr.txt 가 아직 없어서 빌드는 건너뛰어요"; fi
+  - name: Get latest Violet Lite source
+    id: src
+    if: steps.chk.outputs.ok == '1'
+    working-directory: ${{ github.workspace }}
+    run: |
+     REPO=https://github.com/hanyuec8/violet-lite
+     TAG=$(git ls-remote --tags --refs "$REPO" | awk '{print $2}' | sed 's#refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-lite$' | sort -V | tail -n 1 || true)
+     rm -rf up
+     if [ -n "$TAG" ]; then
+       git clone --depth 1 --branch "$TAG" "$REPO" up
+     else
+       TAG=dev
+       git clone --depth 1 "$REPO" up
+     fi
+     FV=$(grep -m1 -E '^\s+flutter:\s*"?[0-9]+\.[0-9]+\.[0-9]+' up/violet/pubspec.yaml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+     echo "원본 버전: $TAG / Flutter ${FV:-3.35.4}"
+     echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+     echo "flutter=${FV:-3.35.4}" >> "$GITHUB_OUTPUT"
   - name: Add taste recommend page
     if: steps.chk.outputs.ok == '1'
     run: |
@@ -1953,7 +1974,7 @@ jobs:
     if: steps.chk.outputs.ok == '1'
     run: |
      mkdir -p lib/pages/viewer/translate
-     cp ../mods/tr.txt lib/pages/viewer/translate/manga_translate.dart
+     cp "$GITHUB_WORKSPACE/mods/tr.txt" lib/pages/viewer/translate/manga_translate.dart
      grep -q "dart:typed_data" lib/pages/viewer/translate/manga_translate.dart || sed -i "1i import 'dart:typed_data';" lib/pages/viewer/translate/manga_translate.dart
      python3 - <<'PY'
      import sys
@@ -2040,7 +2061,7 @@ jobs:
     if: steps.chk.outputs.ok == '1'
     with:
      channel: stable
-     flutter-version: 3.35.4
+     flutter-version: ${{ steps.src.outputs.flutter }}
   - uses: dtolnay/rust-toolchain@stable
     if: steps.chk.outputs.ok == '1'
   - name: Stub server salt files
@@ -2060,7 +2081,8 @@ jobs:
     env:
      GH_TOKEN: ${{ github.token }}
     run: |
-     K=android/build-key.jks
+     K="$GITHUB_WORKSPACE/violet/android/build-key.jks"
+     mkdir -p "$(dirname "$K")"
      AID=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '[.[] | select(.tag_name == "signing-key") | .assets[] | select(.name == "build-key.jks") | .id] | first // empty' 2>/dev/null || true)
      if [ ! -s "$K" ] && [ -n "$AID" ]; then
        gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$AID" > "$K" || rm -f "$K"
@@ -2085,7 +2107,8 @@ jobs:
     if: steps.chk.outputs.ok == '1'
     env:
      GH_TOKEN: ${{ github.token }}
+     SRC_TAG: ${{ steps.src.outputs.tag }}
     run: |
      cp build/app/outputs/flutter-apk/app-release.apk violet-ai.apk
      gh release delete ai-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
-     gh release create ai-latest violet-ai.apk --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Violet AI 추천 + 번역 (최신)" --notes "빌드 번호 $GITHUB_RUN_NUMBER"
+     gh release create ai-latest violet-ai.apk --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Violet AI 추천 + 번역 ($SRC_TAG)" --notes "원본 $SRC_TAG · 빌드 번호 $GITHUB_RUN_NUMBER"
