@@ -2052,6 +2052,144 @@ jobs:
          open(v, 'w', encoding='utf-8').write(s.replace(old, new))
          print(v, 'stack patched')
      PY
+  - name: Use the official Rust library
+    id: rust
+    if: steps.chk.outputs.ok == '1'
+    env:
+     GH_TOKEN: ${{ github.token }}
+     SRC_TAG: ${{ steps.src.outputs.tag }}
+    run: |
+     # 윈도우 전용 경로 설정을 지워요 (리눅스에서 Rust 빌드가 깨지는 원인)
+     sed -i -E '/environment[[:space:]]+"(RUSTUP_HOME|CARGO_HOME)"/d' rust_builder/cargokit/gradle/plugin.gradle
+     D="$RUNNER_TEMP/official"
+     P="$RUNNER_TEMP/prebuilt"
+     rm -rf "$D" "$P"
+     mkdir -p "$D"
+     if [ "$SRC_TAG" != "dev" ]; then
+       gh release download "$SRC_TAG" --repo hanyuec8/violet-lite --pattern '*.apk' --dir "$D" || echo "공식 APK를 못 받았어요 (Rust는 직접 만들어요)"
+     fi
+     python3 -I - "$D" "$P/arm64-v8a/librust_lib_violet.so" lib/src/rust/frb_generated.dart <<'PY'
+     import glob
+     import os
+     import re
+     import struct
+     import sys
+     import zipfile
+
+     apk_dir, out_path, dart_frb = sys.argv[1:4]
+     LIB = 'lib/arm64-v8a/librust_lib_violet.so'
+
+     want = None
+     try:
+         m = re.search(r'rustContentHash\s*=>\s*(-?\d+)', open(dart_frb, encoding='utf-8').read())
+         if m:
+             want = int(m.group(1))
+     except OSError:
+         pass
+
+
+     def frb_hash(d):
+         if d[:4] != b'\x7fELF' or d[4] != 2 or d[5] != 1:
+             return None
+         shoff = struct.unpack_from('<Q', d, 0x28)[0]
+         shentsize, shnum = struct.unpack_from('<HH', d, 0x3A)
+         secs = [struct.unpack_from('<IIQQQQIIQQ', d, shoff + i * shentsize) for i in range(shnum)]
+         phoff = struct.unpack_from('<Q', d, 0x20)[0]
+         phentsize, phnum = struct.unpack_from('<HH', d, 0x36)
+         for _, typ, _, _, off, size, link, _, _, entsize in secs:
+             if typ != 11 or not entsize:
+                 continue
+             stroff = secs[link][4]
+             for j in range(size // entsize):
+                 st_name, _, _, _, st_value, _ = struct.unpack_from('<IBBHQQ', d, off + j * entsize)
+                 a = stroff + st_name
+                 if d[a:d.index(b'\0', a)] != b'frb_get_rust_content_hash':
+                     continue
+                 fo = None
+                 for k in range(phnum):
+                     p_type, _, p_off, p_vaddr, _, p_filesz, _, _ = struct.unpack_from('<IIQQQQQQ', d, phoff + k * phentsize)
+                     if p_type == 1 and p_vaddr <= st_value < p_vaddr + p_filesz:
+                         fo = p_off + st_value - p_vaddr
+                         break
+                 if fo is None:
+                     return None
+                 val = None
+                 for w in struct.unpack_from('<4I', d, fo):
+                     if w == 0xD65F03C0:
+                         break
+                     if (w >> 23) & 0x3F == 0x25:
+                         opc, hw, imm = (w >> 29) & 3, (w >> 21) & 3, (w >> 5) & 0xFFFF
+                         if opc == 2:
+                             val = imm << (16 * hw)
+                         elif opc == 3 and val is not None:
+                             val = (val & ~(0xFFFF << (16 * hw))) | (imm << (16 * hw))
+                         elif opc == 0:
+                             val = ~(imm << (16 * hw)) & 0xFFFFFFFF
+                 if val is None:
+                     return None
+                 val &= 0xFFFFFFFF
+                 return val - (1 << 32) if val >= 1 << 31 else val
+         return None
+
+
+     for apk in sorted(glob.glob(os.path.join(apk_dir, '*.apk'))):
+         try:
+             with zipfile.ZipFile(apk) as z:
+                 data = z.read(LIB)
+         except (KeyError, zipfile.BadZipFile, OSError):
+             continue
+         got = frb_hash(data)
+         print(os.path.basename(apk), 'hash', got, 'want', want)
+         if want is not None and got is not None and got != want:
+             print('-> 버전이 달라서 안 써요')
+             continue
+         os.makedirs(os.path.dirname(out_path), exist_ok=True)
+         open(out_path, 'wb').write(data)
+         print('-> 공식 Rust 라이브러리 사용:', len(data), 'bytes')
+         break
+     else:
+         print('공식 Rust 라이브러리를 못 찾았어요')
+     PY
+     rm -rf "$D"
+     if [ -s "$P/arm64-v8a/librust_lib_violet.so" ]; then
+       python3 -I - <<'PY'
+     import sys
+
+     p = 'rust_builder/cargokit/run_build_tool.sh'
+     s = open(p, encoding='utf-8').read()
+     BLOCK = r'''
+     # [AI 추천 빌드] 공식 Rust 라이브러리가 있으면 그대로 복사하고 끝내요
+     if [ "$1" = "build-gradle" ] && [ -n "${VIOLET_PREBUILT_RUST:-}" ] && [ -d "$VIOLET_PREBUILT_RUST" ]; then
+       for p in $(echo "${CARGOKIT_TARGET_PLATFORMS:-android-arm64}" | tr ',' ' '); do
+         case "$p" in
+           android-arm64) abi=arm64-v8a ;;
+           android-arm) abi=armeabi-v7a ;;
+           android-x64) abi=x86_64 ;;
+           android-x86) abi=x86 ;;
+           *) abi="$p" ;;
+         esac
+         if ! ls "$VIOLET_PREBUILT_RUST/$abi/"*.so >/dev/null 2>&1; then
+           echo "미리 받은 Rust 라이브러리가 없어요: $abi" >&2
+           exit 1
+         fi
+         mkdir -p "$CARGOKIT_OUTPUT_DIR/$abi"
+         cp "$VIOLET_PREBUILT_RUST/$abi/"*.so "$CARGOKIT_OUTPUT_DIR/$abi/"
+         echo "공식 Rust 라이브러리 복사 완료: $abi"
+       done
+       exit 0
+     fi
+     '''
+     if 'VIOLET_PREBUILT_RUST' in s:
+         print(p, 'already patched')
+         sys.exit(0)
+     first, rest = s.split('\n', 1)
+     if not first.startswith('#!'):
+         sys.exit('unexpected run_build_tool.sh header')
+     open(p, 'w', encoding='utf-8').write(first + '\n' + BLOCK + rest)
+     print(p, 'patched')
+     PY
+       echo "dir=$P" >> "$GITHUB_OUTPUT"
+     fi
   - uses: actions/setup-java@v4
     if: steps.chk.outputs.ok == '1'
     with:
@@ -2064,6 +2202,8 @@ jobs:
      flutter-version: ${{ steps.src.outputs.flutter }}
   - uses: dtolnay/rust-toolchain@stable
     if: steps.chk.outputs.ok == '1'
+    with:
+     targets: aarch64-linux-android
   - name: Stub server salt files
     if: steps.chk.outputs.ok == '1'
     run: |
@@ -2100,9 +2240,68 @@ jobs:
      printf 'storePassword=violetlite\nkeyPassword=violetlite\nkeyAlias=violet\nstoreFile=%s\n' "$GITHUB_WORKSPACE/violet/android/build-key.jks" > android/key.properties
   - name: Build APK (arm64)
     if: steps.chk.outputs.ok == '1'
+    env:
+     VIOLET_PREBUILT_RUST: ${{ steps.rust.outputs.dir }}
     run: |
-     flutter pub get
-     flutter build apk --release --target-platform android-arm64
+     set -o pipefail
+     if [ -n "$VIOLET_PREBUILT_RUST" ]; then echo "Rust: 공식 라이브러리를 그대로 써요"; else echo "Rust: 직접 만들어요 (몇 분 더 걸려요)"; fi
+     LOG="$RUNNER_TEMP/build.log"
+     if ! { flutter pub get && flutter build apk --release --target-platform android-arm64; } 2>&1 | tee "$LOG"; then
+       python3 -I - "$LOG" <<'PY'
+     import os
+     import re
+     import subprocess
+     import sys
+
+     lines = open(sys.argv[1], encoding='utf-8', errors='replace').read().splitlines()
+     ansi = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+     pat = re.compile(
+         r'error(\[E\d+\])?:|: Error:|\bERROR:|^e: |Missing class|undefined symbol|'
+         r'No space left|SIGKILL|signal: 9|Could not resolve|Could not find|Out of memory|OutOfMemory|'
+         r'What went wrong|^\s*--> ',
+         re.I,
+     )
+     picked, seen, after = [], set(), 0
+     for raw in lines:
+         s = ansi.sub('', raw).replace('SEVERE: ', '').rstrip()
+         if not s.strip():
+             continue
+         if s.startswith('* ') and 'What went wrong' not in s:
+             after = 0
+             continue
+         keep = after > 0
+         after = max(0, after - 1)
+         if pat.search(s):
+             keep = True
+             if 'What went wrong' in s:
+                 after = 3
+         if keep and s not in seen and 'warning:' not in s.lower():
+             seen.add(s)
+             picked.append(s[:300])
+     picked = picked[:40]
+     if not picked:
+         picked = [ansi.sub('', x).rstrip()[:300] for x in lines[-30:]]
+
+
+     def run(cmd):
+         try:
+             return subprocess.run(cmd, capture_output=True, text=True, timeout=20).stdout.strip()
+         except Exception:
+             return ''
+
+
+     body = '\n'.join(picked)
+     msg = body.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+     print('::error title=빌드 실패 원인::' + msg)
+     summary = os.environ.get('GITHUB_STEP_SUMMARY')
+     if summary:
+         with open(summary, 'a', encoding='utf-8') as f:
+             f.write('## 빌드 실패 원인\n\n이 화면을 캡처해서 보내 주세요.\n\n```text\n')
+             f.write(body + '\n```\n\n')
+             f.write('```text\n' + run(['df', '-h', '/']) + '\n\n' + run(['free', '-h']) + '\n```\n')
+     PY
+       exit 1
+     fi
   - name: Publish APK to Releases
     if: steps.chk.outputs.ok == '1'
     env:
