@@ -44,15 +44,23 @@ jobs:
     if: steps.chk.outputs.ok == '1'
     run: |
      cat > lib/pages/bookmark/taste_recommend_page.dart <<'DART'
+     import 'dart:async';
      import 'dart:convert';
+     import 'dart:io';
      import 'dart:math';
+     import 'dart:typed_data';
+     import 'package:flutter/foundation.dart' show compute;
      import 'package:flutter/material.dart';
+     import 'package:flutter/services.dart';
+     import 'package:http/http.dart' as http;
+     import 'package:path_provider/path_provider.dart';
      import 'package:provider/provider.dart';
      import 'package:shared_preferences/shared_preferences.dart';
      import 'package:violet/algorithm/distance.dart';
      import 'package:violet/component/hitomi/first_page_grouper.dart';
      import 'package:violet/component/hitomi/hybrid_loader.dart';
      import 'package:violet/component/hitomi/population.dart';
+     import 'package:violet/component/hitomi/tag_translate.dart';
      import 'package:violet/component/index.dart';
      import 'package:violet/component/query_translate.dart';
      import 'package:violet/database/database.dart';
@@ -61,8 +69,304 @@ jobs:
      import 'package:violet/database/user/record.dart';
      import 'package:violet/model/article_list_item.dart';
      import 'package:violet/pages/common/utils.dart';
+     import 'package:violet/script/script_manager.dart';
      import 'package:violet/settings/settings.dart';
      import 'package:violet/widgets/article_item/article_list_item_widget.dart';
+     Map<String, dynamic> _readJsonMap(String path) {
+     try {
+     final v = jsonDecode(File(path).readAsStringSync());
+     if (v is Map<String, dynamic>) return v;
+     } catch (_) {}
+     return <String, dynamic>{};
+     }
+     Map<String, dynamic> _pickVectors(List<String> args) {
+     final out = <String, dynamic>{};
+     try {
+     final all = jsonDecode(File(args.first).readAsStringSync());
+     if (all is Map) {
+     for (final n in args.skip(1)) {
+     final v = all[n];
+     if (v is Map) out[n] = v;
+     }
+     }
+     } catch (_) {}
+     return out;
+     }
+     class _Sv {
+     _Sv(this.cover, this.inner);
+     Int8List? cover; // 표지
+     Int8List? inner; // 본문 3장(1/4, 2/4, 3/4 지점)의 평균
+     }
+     class _Style {
+     static const MethodChannel _ch = MethodChannel('xyz.project.violet/style');
+     static bool? _ok;
+     static final Map<int, _Sv> emb = {};
+     static final Set<int> _tried = {}; // 앱을 켠 동안 이미 분석해 본 작품
+     static bool _loaded = false;
+     static bool _dirty = false;
+     static int _active = 0;
+     static final List<Completer<void>> _waiters = [];
+     static Future<bool> available() async {
+     final known = _ok;
+     if (known != null) return known;
+     var r = false;
+     try {
+     r =
+     await _ch
+     .invokeMethod<bool>('available')
+     .timeout(const Duration(seconds: 20)) ??
+     false;
+     } catch (_) {}
+     _ok = r;
+     return r;
+     }
+     static bool complete(int id) {
+     if (_tried.contains(id)) return true;
+     final v = emb[id];
+     return v != null && v.cover != null && v.inner != null;
+     }
+     static Future<T> _limit<T>(Future<T> Function() job) async {
+     while (_active >= 3) {
+     final c = Completer<void>();
+     _waiters.add(c);
+     await c.future;
+     }
+     _active++;
+     try {
+     return await job();
+     } finally {
+     _active--;
+     if (_waiters.isNotEmpty) _waiters.removeAt(0).complete();
+     }
+     }
+     static Future<Int8List?> _embedUrl(
+     String url,
+     Map<String, String> headers,
+     ) async {
+     try {
+     final res = await http
+     .get(Uri.parse(url), headers: headers)
+     .timeout(const Duration(seconds: 10));
+     if (res.statusCode != 200 || res.bodyBytes.isEmpty) return null;
+     final out = await _ch
+     .invokeMethod<Uint8List>('embed', {'bytes': res.bodyBytes})
+     .timeout(const Duration(seconds: 30));
+     if (out == null || out.length < 16) return null;
+     return Int8List.fromList(out);
+     } catch (_) {
+     return null;
+     }
+     }
+     static Int8List? _mean(List<Int8List> vs) {
+     if (vs.isEmpty) return null;
+     final n = vs.first.length;
+     final acc = Float64List(n);
+     var used = 0;
+     for (final v in vs) {
+     if (v.length != n) continue;
+     var norm = 0.0;
+     for (var i = 0; i < n; i++) {
+     norm += v[i] * v[i];
+     }
+     if (norm <= 0) continue;
+     final inv = 1 / sqrt(norm);
+     for (var i = 0; i < n; i++) {
+     acc[i] += v[i] * inv;
+     }
+     used++;
+     }
+     if (used == 0) return null;
+     var mx = 0.0;
+     for (var i = 0; i < n; i++) {
+     final a = acc[i].abs();
+     if (a > mx) mx = a;
+     }
+     if (mx <= 0) return null;
+     final out = Int8List(n);
+     for (var i = 0; i < n; i++) {
+     out[i] = (acc[i] / mx * 127).round().clamp(-127, 127).toInt();
+     }
+     return out;
+     }
+     static Future<_Sv?> of(int id, QueryResult q) async {
+     if (complete(id) || !await available()) return emb[id];
+     return _limit<_Sv?>(() async {
+     if (complete(id)) return emb[id];
+     try {
+     final headers = await ScriptManager.runHitomiGetHeaderContent('$id');
+     var pages = <String>[];
+     try {
+     pages = await HitomiImageResolver.getBigThumbnailUrls(
+     id,
+     ).timeout(const Duration(seconds: 8));
+     } catch (_) {}
+     final v = emb[id] ?? _Sv(null, null);
+     if (v.cover == null) {
+     String? url;
+     final t = q.thumbnail();
+     if (t is String && t.trim().isNotEmpty) {
+     final s = t.trim();
+     url = s.startsWith('//') ? 'https:$s' : s;
+     }
+     if (url == null && pages.isNotEmpty) url = pages.first;
+     if (url != null) v.cover = await _embedUrl(url, headers);
+     }
+     if (v.inner == null && pages.length >= 2) {
+     final n = pages.length;
+     final idx = <int>{};
+     if (n >= 5) {
+     for (final f in const [0.25, 0.5, 0.75]) {
+     idx.add((n * f).floor().clamp(1, n - 2).toInt());
+     }
+     } else {
+     idx.add(1);
+     }
+     final vecs = await Future.wait([
+     for (final i in idx) _embedUrl(pages[i], headers),
+     ]);
+     v.inner = _mean([
+     for (final x in vecs)
+     if (x != null) x,
+     ]);
+     }
+     _tried.add(id);
+     if (v.cover == null && v.inner == null) {
+     emb.remove(id);
+     return null;
+     }
+     emb[id] = v;
+     _dirty = true;
+     return v;
+     } catch (_) {
+     _tried.add(id);
+     return emb[id];
+     }
+     });
+     }
+     static double cos(Int8List a, Int8List b) {
+     final n = min(a.length, b.length);
+     var dot = 0;
+     var na = 0;
+     var nb = 0;
+     for (var i = 0; i < n; i++) {
+     final x = a[i];
+     final y = b[i];
+     dot += x * y;
+     na += x * x;
+     nb += y * y;
+     }
+     if (na == 0 || nb == 0) return 0.0;
+     return dot / sqrt(na.toDouble() * nb.toDouble());
+     }
+     static double sim(_Sv a, _Sv b) {
+     var s = 0.0;
+     var w = 0.0;
+     final ac = a.cover;
+     final bc = b.cover;
+     if (ac != null && bc != null) {
+     s += 0.35 * cos(ac, bc);
+     w += 0.35;
+     }
+     final ai = a.inner;
+     final bi = b.inner;
+     if (ai != null && bi != null) {
+     s += 0.65 * cos(ai, bi);
+     w += 0.65;
+     }
+     return w == 0 ? 0.0 : s / w;
+     }
+     static Future<File?> _file(String name) async {
+     try {
+     final dir = (await getApplicationDocumentsDirectory()).path;
+     return File('$dir/$name');
+     } catch (_) {
+     return null;
+     }
+     }
+     static Future<void> load() async {
+     if (_loaded) return;
+     _loaded = true;
+     try {
+     final f2 = await _file('ai_style_v2.bin');
+     if (f2 != null && await f2.exists()) {
+     final b = await f2.readAsBytes();
+     final bd = ByteData.sublistView(b);
+     var o = 0;
+     while (o + 7 <= b.length) {
+     final id = bd.getUint32(o, Endian.little);
+     final flags = b[o + 4];
+     final n = bd.getUint16(o + 5, Endian.little);
+     o += 7;
+     final need = ((flags & 1) != 0 ? n : 0) + ((flags & 2) != 0 ? n : 0);
+     if (n == 0 || o + need > b.length) break;
+     Int8List? cover;
+     Int8List? inner;
+     if ((flags & 1) != 0) {
+     cover = Int8List.fromList(b.sublist(o, o + n));
+     o += n;
+     }
+     if ((flags & 2) != 0) {
+     inner = Int8List.fromList(b.sublist(o, o + n));
+     o += n;
+     }
+     emb[id] = _Sv(cover, inner);
+     }
+     return;
+     }
+     final f1 = await _file('ai_style_v1.bin');
+     if (f1 == null || !await f1.exists()) return;
+     final b = await f1.readAsBytes();
+     final bd = ByteData.sublistView(b);
+     var o = 0;
+     while (o + 6 <= b.length) {
+     final id = bd.getUint32(o, Endian.little);
+     final n = bd.getUint16(o + 4, Endian.little);
+     o += 6;
+     if (n == 0 || o + n > b.length) break;
+     emb[id] = _Sv(Int8List.fromList(b.sublist(o, o + n)), null);
+     o += n;
+     }
+     _dirty = true;
+     } catch (_) {}
+     }
+     static Future<void> save() async {
+     if (!_dirty) return;
+     _dirty = false;
+     try {
+     while (emb.length > 4000) {
+     emb.remove(emb.keys.first);
+     }
+     var total = 0;
+     for (final v in emb.values) {
+     total += 7 + (v.cover?.length ?? 0) + (v.inner?.length ?? 0);
+     }
+     final out = Uint8List(total);
+     final bd = ByteData.sublistView(out);
+     var o = 0;
+     for (final e in emb.entries) {
+     final c = e.value.cover;
+     final i = e.value.inner;
+     final n = c?.length ?? i?.length ?? 0;
+     final ok = n > 0 && (c == null || c.length == n) && (i == null || i.length == n);
+     if (!ok) continue;
+     bd.setUint32(o, e.key, Endian.little);
+     out[o + 4] = (c != null ? 1 : 0) | (i != null ? 2 : 0);
+     bd.setUint16(o + 5, n, Endian.little);
+     o += 7;
+     for (final part in [c, i]) {
+     if (part == null) continue;
+     for (var k = 0; k < n; k++) {
+     out[o + k] = part[k] & 0xFF;
+     }
+     o += n;
+     }
+     }
+     final f = await _file('ai_style_v2.bin');
+     if (f == null) return;
+     await f.writeAsBytes(Uint8List.sublistView(out, 0, o), flush: true);
+     } catch (_) {}
+     }
+     }
      class TasteRecommendPage extends StatefulWidget {
      const TasteRecommendPage({super.key});
      @override
@@ -79,6 +383,7 @@ jobs:
      final _Src src;
      String label = '';
      bool explore = false;
+     double? style;
      }
      class _Sample {
      _Sample(this.f, this.y, this.w);
@@ -192,6 +497,15 @@ jobs:
      static const String _kSimCacheKey = 'ai_similar_cache_v2';
      static const String _kPageCacheKey = 'ai_page_cache_v1';
      static const String _kFeedbackKey = 'ai_feedback_v1';
+     static const String _kHelpKey = 'ai_help_seen_v2';
+     static const String _kHelpText = "👍 좋아요\n· 그 작품의 작가와 태그를 AI가 '내가 좋아하는 것'으로 배워요.\n· 바로 아래에 비슷한 작품을 최대 3개 넣어 줘요. (연관 작품, 같은 작가 작품, 그 작가와 비슷한 작가의 작품)\n· 다음 뽑기부터 그 작가 작품과 비슷한 작가의 작품이 더 자주 나와요.\n· 여러 작품에 같은 태그가 자주 나오면 그 태그를 더 좋아한다고 배워요.\n\n👎 별로예요\n· 그 작품을 목록에서 빼요.\n· 그 작품의 태그와 작가는 덜 추천해요.\n· 잘못 눌렀으면 아래 알림의 '되돌리기'를 누르세요.\n\n🎨 그림체\n· 좋아한 작품(👍, 북마크, 끝까지 본 작품)의 표지와 본문 그림 3장을 폰 안의 작은 AI가 분석해요.\n· 선, 채색, 명암, 분위기가 비슷할수록 위로 올리고, 카드에 '그림체 n%'로 보여 줘요. 본문 그림을 표지보다 더 중요하게 봐요.\n· 처음 한 번은 분석에 3~5분 걸려요. 위쪽 '그림체'를 눌러 끄고 켤 수 있어요.\n\n· 같은 버튼을 한 번 더 누르면 취소되고, 배운 것도 되돌려요.\n· 누른 기록은 저장돼서 앱을 다시 켜도 계속 반영돼요.\n· '취향 n%'는 AI가 예상한, 내가 그 작품을 좋아할 확률이에요.";
+     static Map<String, dynamic>? _tagIdxFile;
+     static final Map<String, dynamic> _vecArtist = {};
+     static final Map<String, dynamic> _vecGroup = {};
+     static final Set<String> _vecMiss = {};
+     static bool _vecLoaded = false;
+     static const String _kStyleOnKey = 'ai_style_on_v1';
+     static const double _kStyleW = 0.8; // 그림체가 내 취향에 가까울수록 이만큼 점수를 더해요
      final Random _rand = Random();
      _Mode _mode = _Mode.taste;
      final Map<_Mode, _Profile> _profiles = {
@@ -230,6 +544,19 @@ jobs:
      final Map<String, String> _strs = {};
      final Map<String, List<(String, double)>> _simCache = {};
      final Map<String, String> _idxToToken = {};
+     final Map<String, double> _cntCache = {};
+     final Set<String> _simEmpty = {};
+     bool _simDirty = false;
+     final Set<int> _expanding = {};
+     final Map<int, Map<_Mode, Map<String, double?>>> _fbSnaps = {};
+     bool _helpSeen = true;
+     bool _styleOn = true;
+     bool _styleAvail = false;
+     bool _styleBusy = false;
+     int _styleDone = 0;
+     int _styleTotal = 0;
+     final List<(_Sv, double)> _stylePos = [];
+     final List<(_Sv, double)> _styleNeg = [];
      double _maxTagCount = 0;
      int _engagedCount = 0;
      int _bouncedCount = 0;
@@ -270,8 +597,11 @@ jobs:
      _loadIdRange(),
      _loadTagStats(),
      _loadPopulation(),
+     _loadHelp(),
+     _styleInit(),
      ]);
      await _loadBase();
+     _rebuildStyleSets();
      } catch (e) {
      if (!mounted) return;
      setState(() {
@@ -281,6 +611,7 @@ jobs:
      return;
      }
      await _enterMode(_Mode.taste);
+     if (mounted && _styleAvail && _styleOn) unawaited(_buildStyleProfile());
      }
      String _norm(String s) => s
      .trim()
@@ -352,10 +683,11 @@ jobs:
      if (raw != null) {
      final m = jsonDecode(raw) as Map<String, dynamic>;
      m.forEach((base, list) {
-     _simCache[base] = [
+     final sims = [
      for (final e in list as List)
      ('${(e as List)[0]}', (e[1] as num).toDouble()),
      ];
+     if (sims.isNotEmpty) _simCache[base] = sims;
      });
      }
      for (final s in prefs.getStringList(_kPageCacheKey) ?? const <String>[]) {
@@ -418,36 +750,217 @@ jobs:
      const Duration(seconds: 10),
      );
      } catch (_) {}
-     final tc = HentaiIndex.tagCount;
-     if (tc != null) {
      for (final g in ['female', 'male', 'tag']) {
-     final m = tc[g];
-     if (m is Map) {
+     Map<String, int>? m;
+     try {
+     m = HentaiIndex.getGroupMap(g);
+     } catch (_) {}
+     if (m == null) continue;
      for (final v in m.values) {
-     if (v is num && v > _maxTagCount) _maxTagCount = v.toDouble();
+     if (v > _maxTagCount) _maxTagCount = v.toDouble();
      }
      }
+     if (HentaiIndex.tagIndex.isEmpty && _tagIdxFile == null) {
+     final f = await _indexFile('tag-index.json');
+     if (f != null) {
+     try {
+     _tagIdxFile = await compute(
+     _readJsonMap,
+     f.path,
+     ).timeout(const Duration(seconds: 20));
+     } catch (_) {}
      }
      }
-     HentaiIndex.tagIndex.forEach((tag, idx) {
+     _tagIdx.forEach((tag, idx) {
      _idxToToken['$idx'] = _norm(tag);
      });
      }
+     Map<String, dynamic> get _tagIdx => HentaiIndex.tagIndex.isNotEmpty
+     ? HentaiIndex.tagIndex
+     : (_tagIdxFile ?? const <String, dynamic>{});
      double _idf(String token) {
      if (_maxTagCount <= 0) return 1.0;
-     final tc = HentaiIndex.tagCount;
+     final c = _cntCache.putIfAbsent(token, () {
      final i = token.indexOf(':');
      final group = i >= 0 ? token.substring(0, i) : 'tag';
-     final name = (i >= 0 ? token.substring(i + 1) : token).replaceAll('_', ' ');
-     final m = tc?[group];
-     final c = (m is Map && m[name] is num) ? (m[name] as num).toDouble() : 0.0;
+     final name = (i >= 0 ? token.substring(i + 1) : token).replaceAll(
+     '_',
+     ' ',
+     );
+     try {
+     return HentaiIndex.getCount(group, name).toDouble();
+     } catch (_) {
+     return 0.0;
+     }
+     });
      return log(1 + _maxTagCount / (1 + c));
      }
+     Future<File?> _indexFile(String name) async {
+     try {
+     final dir = (await getApplicationDocumentsDirectory()).path;
+     for (final path in ['$dir/data/$name', '$dir/$name']) {
+     final f = File(path);
+     if (await f.exists()) return f;
+     }
+     } catch (_) {}
+     return null;
+     }
+     bool get _needVecFiles =>
+     HentaiIndex.tagArtist.isEmpty && HentaiIndex.tagGroup.isEmpty;
+     Map<String, dynamic>? _vecOf(String name, ArtistType type) {
+     final isGroup = type == ArtistType.group;
+     final v =
+     (isGroup ? HentaiIndex.tagGroup : HentaiIndex.tagArtist)[name] ??
+     (isGroup ? _vecGroup : _vecArtist)[name];
+     if (v is Map<String, dynamic>) return v;
+     if (v is Map) return Map<String, dynamic>.from(v);
+     return null;
+     }
+     Future<File?> _vecCacheFile() async {
+     try {
+     final dir = (await getApplicationDocumentsDirectory()).path;
+     return File('$dir/ai_vec_cache_v1.json');
+     } catch (_) {
+     return null;
+     }
+     }
+     Future<void> _loadVecCache() async {
+     if (_vecLoaded) return;
+     _vecLoaded = true;
+     final f = await _vecCacheFile();
+     if (f == null || !await f.exists()) return;
+     try {
+     final m = await compute(_readJsonMap, f.path);
+     final a = m['a'];
+     final g = m['g'];
+     final miss = m['miss'];
+     if (a is Map) {
+     a.forEach((k, v) {
+     if (v is Map) _vecArtist['$k'] = v;
+     });
+     }
+     if (g is Map) {
+     g.forEach((k, v) {
+     if (v is Map) _vecGroup['$k'] = v;
+     });
+     }
+     if (miss is List) _vecMiss.addAll(miss.map((e) => '$e'));
+     } catch (_) {}
+     }
+     Future<void> _saveVecCache() async {
+     try {
+     void trim(Map<String, dynamic> m) {
+     while (m.length > 1500) {
+     m.remove(m.keys.first);
+     }
+     }
+     trim(_vecArtist);
+     trim(_vecGroup);
+     final miss = _vecMiss.toList();
+     final f = await _vecCacheFile();
+     if (f == null) return;
+     await f.writeAsString(
+     jsonEncode({
+     'a': _vecArtist,
+     'g': _vecGroup,
+     'miss': miss.length > 3000 ? miss.sublist(miss.length - 3000) : miss,
+     }),
+     );
+     } catch (_) {}
+     }
+     Future<void> _ensureVecs(Set<String> artists, Set<String> groups) async {
+     if (!_needVecFiles) return;
+     await _loadVecCache();
+     var changed = false;
+     Future<void> load(
+     String file,
+     Set<String> names,
+     Map<String, dynamic> into,
+     String pre,
+     ) async {
+     final need = [
+     for (final n in names)
+     if (!into.containsKey(n) && !_vecMiss.contains('$pre:$n')) n,
+     ];
+     if (need.isEmpty) return;
+     final f = await _indexFile(file);
+     if (f == null) return;
+     _setStatus('작가들이 자주 쓰는 태그 읽는 중...');
+     try {
+     final got = await compute(_pickVectors, [
+     f.path,
+     ...need,
+     ]).timeout(const Duration(seconds: 40));
+     into.addAll(got);
+     for (final n in need) {
+     if (!got.containsKey(n)) _vecMiss.add('$pre:$n');
+     }
+     changed = true;
+     } catch (_) {}
+     }
+     await load('tag-artist.json', artists, _vecArtist, 'a');
+     await load('tag-group.json', groups, _vecGroup, 'g');
+     if (changed) await _saveVecCache();
+     }
+     List<(String, double)> _similarOf(String name, ArtistType type) {
+     final key = '${type.name}:$name';
+     final hit = _simCache[key];
+     if (hit != null) return hit;
+     if (_simEmpty.contains(key)) return const [];
+     List<(String, double)> sims;
+     try {
+     sims =
+     (type == ArtistType.group
+     ? HentaiIndex.calculateSimilarGroups(name)
+     : HentaiIndex.calculateSimilarArtists(name))
+     .take(_kSimilarPerArtist)
+     .toList();
+     } catch (_) {
+     sims = [];
+     }
+     if (sims.isEmpty) {
+     _simEmpty.add(key);
+     } else {
+     _simCache[key] = sims;
+     _simDirty = true;
+     }
+     return sims;
+     }
+     Future<void> _prepareVectors(
+     Iterable<(String, ArtistType)> direct,
+     List<(String, ArtistType)> bases,
+     ) async {
+     if (!_needVecFiles) return;
+     final artists = <String>{};
+     final groups = <String>{};
+     void want(String n, ArtistType t) {
+     if (t == ArtistType.group) {
+     groups.add(n);
+     } else if (t == ArtistType.artist) {
+     artists.add(n);
+     }
+     }
+     for (final (n, t) in direct) {
+     want(n, t);
+     }
+     for (final (n, t) in bases) {
+     if (t != ArtistType.artist && t != ArtistType.group) continue;
+     await Future<void>.delayed(Duration.zero);
+     for (final (o, _) in _similarOf(n, t)) {
+     want(o, t);
+     }
+     }
+     if (_simDirty) {
+     _simDirty = false;
+     _saveCaches();
+     }
+     try {
+     await _ensureVecs(artists, groups).timeout(const Duration(seconds: 60));
+     } catch (_) {}
+     }
      Map<String, double> _artistShare(String name, ArtistType type) {
-     final v = (type == ArtistType.group
-     ? HentaiIndex.tagGroup
-     : HentaiIndex.tagArtist)[name];
-     if (v is! Map) return const {};
+     final v = _vecOf(name, type);
+     if (v == null) return const {};
      var top = 0.0;
      v.forEach((k, c) {
      if (c is num && c > top) top = c.toDouble();
@@ -657,7 +1170,7 @@ jobs:
      void _buildVec(_Profile p) {
      p.vec.clear();
      p.weights.forEach((token, w) {
-     final key = HentaiIndex.tagIndex[token.replaceAll('_', ' ')];
+     final key = _tagIdx[token.replaceAll('_', ' ')];
      if (key != null) p.vec[key.toString()] = w;
      });
      }
@@ -692,6 +1205,34 @@ jobs:
      if (pg > 0) pages.add(pg);
      }
      final total = max(1, metas.length);
+     final arts = artistCount.entries.where((e) => e.value >= 2).toList()
+     ..sort((a, b) => b.value.compareTo(a.value));
+     final favNames = _favArtists.map((e) => e.$1).toSet();
+     final bmArtists = [
+     for (final e in arts.take(15))
+     if (!favNames.contains(e.key.$1)) e.key,
+     ];
+     final favBases =
+     _favArtists
+     .where((e) => e.$2 == ArtistType.artist || e.$2 == ArtistType.group)
+     .toList()
+     ..shuffle(_rand);
+     final likedBases = _likedArtists()
+     .where((e) => !favNames.contains(e.$1))
+     .take(6)
+     .toList();
+     final likedNames = likedBases.map((e) => e.$1).toSet();
+     p.simBases = [
+     ...favBases.take(12),
+     ...likedBases,
+     ...bmArtists.where((e) => !likedNames.contains(e.$1)),
+     ...favBases.skip(12),
+     ].take(_kSimilarBases).toList();
+     await _prepareVectors([
+     ..._favArtists.take(40),
+     ...bmArtists,
+     ...likedBases,
+     ], p.simBases);
      final favShare = <String, double>{};
      var favN = 0;
      for (final (name, type) in _favArtists.take(40)) {
@@ -721,8 +1262,6 @@ jobs:
      (a, b) => (b.value * _idf(b.key)).compareTo(a.value * _idf(a.key)),
      );
      _anFavTags = favTop.take(6).map((e) => e.key).toList();
-     final arts = artistCount.entries.where((e) => e.value >= 2).toList()
-     ..sort((a, b) => b.value.compareTo(a.value));
      _anArtists = [for (final e in arts.take(8)) (e.key.$1, e.value)];
      final langs = langCount.entries.toList()
      ..sort((a, b) => b.value.compareTo(a.value));
@@ -731,18 +1270,7 @@ jobs:
      ];
      pages.sort();
      _anPages = pages.isEmpty ? null : pages[pages.length ~/ 2];
-     final favNames = _favArtists.map((e) => e.$1).toSet();
-     final bmArtists = [
-     for (final e in arts.take(15))
-     if (!favNames.contains(e.key.$1)) e.key,
-     ];
      p.artists = [..._favArtists, ...bmArtists];
-     final favBases =
-     _favArtists
-     .where((e) => e.$2 == ArtistType.artist || e.$2 == ArtistType.group)
-     .toList()
-     ..shuffle(_rand);
-     p.simBases = [...favBases, ...bmArtists].take(_kSimilarBases).toList();
      _buildVec(p);
      p.weights.forEach((t, v) => p.model.prior['t:$t'] = 1.2 * v);
      for (final (name, type) in _favArtists) {
@@ -790,7 +1318,12 @@ jobs:
      ..sort((a, b) => b.value.compareTo(a.value));
      _finishWeights(p, raw);
      p.artists = ranked.take(10).map((e) => e.key).toList();
-     p.simBases = List.of(p.artists);
+     final recentNames = p.artists.map((e) => e.$1).toSet();
+     p.simBases = [
+     ...p.artists,
+     ..._likedArtists().where((e) => !recentNames.contains(e.$1)).take(4),
+     ];
+     await _prepareVectors(p.simBases, p.simBases);
      _buildVec(p);
      p.weights.forEach((t, v) => p.model.prior['t:$t'] = 1.2 * v);
      for (final (name, type) in p.artists) {
@@ -1064,9 +1597,40 @@ jobs:
      }
      return out;
      }
+     List<(String, ArtistType)> _likedArtists() {
+     final out = <(String, ArtistType)>[];
+     final seen = <String>{};
+     final ids = [
+     for (final e in _feedback.entries)
+     if (e.value > 0) e.key,
+     ].reversed;
+     for (final id in ids) {
+     final q = _fbMetas[id];
+     if (q == null) continue;
+     final artists = _splitNames(q.artists());
+     if (artists.isNotEmpty) {
+     for (final a in artists) {
+     if (seen.add(a)) out.add((a, ArtistType.artist));
+     }
+     } else {
+     for (final g in _splitNames(q.groups())) {
+     if (seen.add(g)) out.add((g, ArtistType.group));
+     }
+     }
+     if (out.length >= 10) break;
+     }
+     return out;
+     }
      Future<void> _fillArtists(_Profile p, _Mode mode) async {
-     final list = p.artists.where((e) => _safeName(e.$1)).toList();
-     if (mode == _Mode.taste) list.shuffle(_rand);
+     final base = p.artists.where((e) => _safeName(e.$1)).toList();
+     if (mode == _Mode.taste) base.shuffle(_rand);
+     final known = base.map((e) => e.$1).toSet();
+     final liked = _likedArtists()
+     .where((e) => _safeName(e.$1) && !known.contains(e.$1))
+     .take(5)
+     .toList();
+     final likedNames = liked.map((e) => e.$1).toSet();
+     final list = [...liked, ...base];
      if (list.isEmpty) return;
      final use = list.take(20).toList();
      final rows = _hasDb
@@ -1077,7 +1641,9 @@ jobs:
      for (final q in rows) {
      final who = _matchName(q, names);
      final String label;
-     if (mode == _Mode.recent) {
+     if (who != null && likedNames.contains(who)) {
+     label = '👍 좋아요한 작가';
+     } else if (mode == _Mode.recent) {
      label = '최근 본 작가';
      } else if (who != null && !favNames.contains(who)) {
      label = '자주 북마크한 작가';
@@ -1099,28 +1665,13 @@ jobs:
      ..._favArtists.map((e) => e.$1),
      };
      var done = 0;
-     var computed = false;
      while (done < n && p.simBaseCursor < p.simBases.length) {
      final (name, type) = p.simBases[p.simBaseCursor++];
      done++;
-     final isGroup = type == ArtistType.group;
-     final key = '${type.name}:$name';
-     var sims = _simCache[key];
-     if (sims == null) {
+     if (!_simCache.containsKey('${type.name}:$name')) {
      await Future<void>.delayed(Duration.zero);
-     try {
-     sims = (isGroup
-     ? HentaiIndex.calculateSimilarGroups(name)
-     : HentaiIndex.calculateSimilarArtists(name))
-     .take(_kSimilarPerArtist)
-     .toList();
-     } catch (_) {
-     sims = [];
      }
-     _simCache[key] = sims;
-     computed = true;
-     }
-     final vecs = isGroup ? HentaiIndex.tagGroup : HentaiIndex.tagArtist;
+     final sims = _similarOf(name, type);
      final found = <(String, ArtistType, double, String)>[];
      for (final (other, _) in sims) {
      if (own.contains(other) ||
@@ -1128,8 +1679,8 @@ jobs:
      p.similarNames.contains(other)) {
      continue;
      }
-     final vec = vecs[other];
-     final match = (p.vec.isNotEmpty && vec is Map<String, dynamic>)
+     final vec = _vecOf(other, type);
+     final match = (p.vec.isNotEmpty && vec != null)
      ? Distance.cosineDistance(p.vec, vec)
      : 0.0;
      found.add((other, type, match, name));
@@ -1142,7 +1693,10 @@ jobs:
      }
      }
      p.similar.sort((a, b) => b.$3.compareTo(a.$3));
-     if (computed) _saveCaches();
+     if (_simDirty) {
+     _simDirty = false;
+     _saveCaches();
+     }
      }
      Future<void> _fillSimilar(_Profile p, _Mode mode) async {
      await _computeSimilarSome(p, 5);
@@ -1392,6 +1946,7 @@ jobs:
      _drawing = false;
      }
      if (mounted) _prefetchPages(_p);
+     if (mounted && _styleReady) _prefetchStyle(_p);
      }
      double _quality(int id) {
      if (!Population.isLoaded) return 0.0;
@@ -1422,23 +1977,49 @@ jobs:
      final p = _p;
      final mode = _mode;
      final keyed = <(_Cand, double, double, double)>[];
+     final us = <int, double>{};
      for (final c in p.pool.values) {
      if (!_isNew(c.id)) continue;
      final m = p.model.logit(_featsOf(c.id, c.q));
      final z = (m + c.bonus + _quality(c.id)).clamp(-12.0, 12.0).toDouble();
      final u = max(_rand.nextDouble(), 1e-12);
+     us[c.id] = u;
      keyed.add((c, z, log(u) / exp(z / _kTemp), m));
      }
      keyed.sort((a, b) => b.$3.compareTo(a.$3));
+     final styleOn = _styleReady;
      final head = keyed
      .where((e) => e.$2 >= _kMinLogit)
-     .take(_kResultCount + 8)
+     .take(_kResultCount + (styleOn ? 24 : 8))
      .map((e) => e.$1)
      .toList();
-     if (head.any((c) => _knownPages(c) == null)) {
-     if (_results.isEmpty) _setStatus('작품 페이지 수 확인 중...');
-     await _verifyPages(head);
+     final needPages = head.any((c) => _knownPages(c) == null);
+     if (needPages || styleOn) {
+     if (_results.isEmpty) {
+     _setStatus(styleOn ? '페이지 수와 그림체 확인 중...' : '작품 페이지 수 확인 중...');
+     }
+     await Future.wait([
+     if (needPages) _verifyPages(head),
+     if (styleOn) _ensureStyle(head, const Duration(seconds: 4)),
+     ]);
      if (!mounted || _mode != mode) return;
+     }
+     var styleUsed = false;
+     if (styleOn) {
+     final sz = _styleZ(head);
+     if (sz.isNotEmpty) {
+     styleUsed = true;
+     for (var i = 0; i < keyed.length; i++) {
+     final e = keyed[i];
+     final s = sz[e.$1.id];
+     e.$1.style = s;
+     if (s == null) continue;
+     final z2 = (e.$2 + _kStyleW * s).clamp(-12.0, 12.0).toDouble();
+     final u = us[e.$1.id] ?? 0.5;
+     keyed[i] = (e.$1, z2, log(u) / exp(z2 / _kTemp), e.$4);
+     }
+     keyed.sort((a, b) => b.$3.compareTo(a.$3));
+     }
      }
      final picked = <_Cand>[];
      final pickedTitles = <String>{};
@@ -1473,9 +2054,12 @@ jobs:
      perSrc[c.src] = n + 1;
      final pct = (_TasteModel.sig(m) * 100).round();
      c.explore = explore;
-     c.label = explore
+     if (!styleUsed) c.style = null;
+     c.label =
+     (explore
      ? '새로운 발견 · AI 예상 취향 $pct%'
-     : '${c.reason} · 취향 $pct%';
+     : '${c.reason} · 취향 $pct%') +
+     _stylePct(c);
      picked.add(c);
      return true;
      }
@@ -1525,6 +2109,7 @@ jobs:
      );
      addPart('비슷한 작가', perSrc[_Src.similar] ?? 0);
      addPart('비슷한 작품', perSrc[_Src.related] ?? 0);
+     if (styleUsed) parts.add('그림체 반영');
      setState(() {
      _loading = false;
      _status = '';
@@ -1562,6 +2147,10 @@ jobs:
      void _onFeedback(_Cand c, int v) {
      final prev = _feedback[c.id] ?? 0;
      final cancel = prev == v;
+     final f = _featsOf(c.id, c.q);
+     final old = _fbSnaps.remove(c.id);
+     if (old != null) _restore(old);
+     final index = _results.indexOf(c);
      setState(() {
      _feedback.remove(c.id);
      if (!cancel) _feedback[c.id] = v;
@@ -1569,26 +2158,278 @@ jobs:
      });
      if (!cancel) {
      _fbMetas[c.id] = c.q;
-     final f = _featsOf(c.id, c.q);
+     _fbSnaps[c.id] = _snapshot(f);
      for (final prof in _profiles.values) {
      if (prof.built) prof.model.learn(f, v > 0 ? 1.0 : 0.0);
      }
      }
      _saveFeedback();
+     _styleFeedback(c);
      final messenger = ScaffoldMessenger.maybeOf(context);
      messenger?.hideCurrentSnackBar();
+     if (cancel) {
+     messenger?.showSnackBar(
+     const SnackBar(
+     duration: Duration(milliseconds: 1500),
+     content: Text('취소했어요. 배운 것도 되돌렸어요.'),
+     ),
+     );
+     return;
+     }
+     final names = _fbNames(f, v > 0);
+     final what = names.isEmpty ? '이런 작품' : names.join(' · ');
      messenger?.showSnackBar(
      SnackBar(
-     duration: const Duration(milliseconds: 1500),
+     duration: const Duration(seconds: 4),
      content: Text(
-     cancel
-     ? '취소했어요'
-     : (v > 0
-     ? '좋아요! 이런 작품을 더 추천할게요'
-     : '알겠어요. 이런 작품은 덜 추천할게요'),
+     v > 0
+     ? '👍 배웠어요: $what\n이런 작품을 더 추천하고, 비슷한 작품을 바로 아래에 넣을게요.'
+     : '👎 배웠어요: $what\n이런 작품은 덜 추천할게요.',
+     ),
+     action: SnackBarAction(
+     label: '되돌리기',
+     onPressed: () => _undoFeedback(c, index),
      ),
      ),
      );
+     if (v > 0) _moreLikeThis(c);
+     }
+     void _undoFeedback(_Cand c, int index) {
+     if (!mounted) return;
+     final snap = _fbSnaps.remove(c.id);
+     if (snap != null) _restore(snap);
+     setState(() {
+     _feedback.remove(c.id);
+     if (!_results.contains(c)) {
+     _results.insert(min(max(index, 0), _results.length), c);
+     }
+     });
+     _saveFeedback();
+     _rebuildStyleSets();
+     }
+     Map<_Mode, Map<String, double?>> _snapshot(List<String> f) => {
+     for (final e in _profiles.entries)
+     if (e.value.built) e.key: {for (final k in f) k: e.value.model.w[k]},
+     };
+     void _restore(Map<_Mode, Map<String, double?>> snap) {
+     snap.forEach((mode, ws) {
+     final m = _profiles[mode]!.model;
+     ws.forEach((k, v) {
+     if (v == null) {
+     m.w.remove(k);
+     } else {
+     m.w[k] = v;
+     }
+     final s = (m.support[k] ?? 1) - 1;
+     if (s <= 0) {
+     m.support.remove(k);
+     } else {
+     m.support[k] = s;
+     }
+     });
+     });
+     }
+     List<String> _fbNames(List<String> f, bool like) {
+     final m = _p.model;
+     final feats = f.where((k) => !k.startsWith('y:')).toList()
+     ..sort(
+     (a, b) => like
+     ? m.value(b).compareTo(m.value(a))
+     : m.value(a).compareTo(m.value(b)),
+     );
+     final who = feats
+     .where((k) => !k.startsWith('t:'))
+     .where((k) => like ? m.value(k) > 0 : m.value(k) < 0)
+     .take(1)
+     .toList();
+     final tags = feats
+     .where((k) => k.startsWith('t:'))
+     .take(who.isEmpty ? 3 : 2)
+     .toList();
+     return [for (final k in [...who, ...tags]) _featLabel(k)];
+     }
+     Future<void> _moreLikeThis(_Cand liked) async {
+     if (_expanding.contains(liked.id)) return;
+     final mode = _mode;
+     final roll = _rollCount;
+     final p = _p;
+     setState(() => _expanding.add(liked.id));
+     final title = _shortTitle(liked.q);
+     final found = <int, QueryResult>{};
+     final why = <int, (String, int)>{};
+     void put(QueryResult q, String reason, int src) {
+     final id = _idOf(q);
+     if (id == null || id == liked.id || found.containsKey(id)) return;
+     found[id] = q;
+     why[id] = (reason, src);
+     }
+     try {
+     final info = await FirstPageGrouper.getGalleryInfo(
+     liked.id,
+     ).timeout(const Duration(seconds: 5));
+     final rel = info == null ? null : info['related'];
+     if (rel is List) {
+     final ids = <int>[];
+     for (final e in rel.take(15)) {
+     final id = int.tryParse('$e');
+     if (id != null && _isNew(id)) ids.add(id);
+     }
+     final metas = await _loadMetadata(ids, maxNetwork: 10);
+     for (final q in metas.values) {
+     put(q, '👍 ‘$title’과(와) 비슷해요', 0);
+     }
+     }
+     } catch (_) {}
+     final who = _mainArtist(liked.q);
+     if (_safeName(who)) {
+     final type = _splitNames(liked.q.artists()).isNotEmpty
+     ? ArtistType.artist
+     : ArtistType.group;
+     try {
+     final rows = _hasDb
+     ? await _localQuery(
+     _orTokens([(who, type)]),
+     limit: 40,
+     maxPage: 1,
+     )
+     : await _networkArtists([(who, type)]);
+     for (final q in rows) {
+     put(q, '👍 같은 작가: $who', 1);
+     }
+     } catch (_) {}
+     try {
+     final sims = [
+     for (final (o, _) in _similarOf(who, type))
+     if (o != who && _safeName(o)) o,
+     ];
+     if (sims.isNotEmpty && _needVecFiles) {
+     final names = sims.toSet();
+     await _ensureVecs(
+     type == ArtistType.group ? <String>{} : names,
+     type == ArtistType.group ? names : <String>{},
+     );
+     }
+     final simRanked = <(String, double)>[];
+     for (final o in sims) {
+     final vec = _vecOf(o, type);
+     final match = (p.vec.isNotEmpty && vec != null)
+     ? Distance.cosineDistance(p.vec, vec)
+     : 0.0;
+     simRanked.add((o, match));
+     }
+     simRanked.sort((a, b) => b.$2.compareTo(a.$2));
+     var pick = simRanked.where((e) => e.$2 >= _kMinMatch).take(4).toList();
+     if (pick.isEmpty) pick = simRanked.take(2).toList();
+     if (pick.isNotEmpty) {
+     final pairs = [for (final e in pick) (e.$1, type)];
+     final rows = _hasDb
+     ? await _localQuery(_orTokens(pairs), limit: 60, maxPage: 1)
+     : await _networkArtists(pairs.take(2));
+     final names = pick.map((e) => e.$1).toList();
+     for (final q in rows) {
+     final o = _matchName(q, names) ?? names.first;
+     put(q, '👍 $who와(과) 비슷한 작가: $o', 2);
+     }
+     }
+     } catch (_) {}
+     for (final prof in _profiles.values) {
+     if (!prof.built || prof.simBases.any((e) => e.$1 == who)) continue;
+     prof.simBases.insert(
+     min(prof.simBaseCursor, prof.simBases.length),
+     (who, type),
+     );
+     }
+     }
+     if (!mounted) return;
+     if (_mode != mode || _rollCount != roll || !_results.contains(liked)) {
+     setState(() => _expanding.remove(liked.id));
+     return;
+     }
+     final shown = _results.map((e) => e.id).toSet();
+     final scored = <(_Cand, double, int)>[];
+     found.forEach((id, q) {
+     if (!_isNew(id) || shown.contains(id) || _hasExcluded(q)) return;
+     final pg = _pages(q) ?? 0;
+     if (pg > 0 && pg < _kMinPages) return;
+     final checked = _pageCache[id] ?? 0;
+     if (checked > 0 && checked < _kMinPages) return;
+     final tk = _titleKey(q);
+     if (tk.isNotEmpty &&
+     (_ownTitles.contains(tk) || _seenTitles.contains(tk))) {
+     return;
+     }
+     final m = p.model.logit(_featsOf(id, q));
+     if (m < _kMinLogit) return;
+     final w = why[id];
+     if (w == null) return;
+     scored.add((_Cand(id, q, 0.0, w.$1, _Src.related), m, w.$2));
+     });
+     scored.sort((a, b) => b.$2.compareTo(a.$2));
+     final top = scored.take(14).toList();
+     final cands = [for (final e in top) e.$1];
+     try {
+     await Future.wait([
+     _verifyPages(cands),
+     if (_styleReady) _ensureStyle(cands, const Duration(seconds: 4)),
+     ]);
+     } catch (_) {}
+     if (!mounted) return;
+     final sz = _styleReady ? _styleZ(cands) : const <int, double>{};
+     final ranked = [
+     for (final e in top) (e.$1, e.$2 + _kStyleW * (sz[e.$1.id] ?? 0.0), e.$3),
+     ]..sort((a, b) => b.$2.compareTo(a.$2));
+     final picks = <_Cand>[];
+     final titles = <String>{};
+     final perArtist = <String, int>{};
+     bool tryAdd(_Cand c) {
+     if (picks.contains(c)) return false;
+     final pg = _knownPages(c) ?? 0;
+     if (pg > 0 && pg < _kMinPages) return false;
+     final tk = _titleKey(c.q);
+     if (tk.isNotEmpty && titles.contains(tk)) return false;
+     final a = _mainArtist(c.q);
+     if (a.isNotEmpty && (perArtist[a] ?? 0) >= 2) return false;
+     if (tk.isNotEmpty) titles.add(tk);
+     if (a.isNotEmpty) perArtist[a] = (perArtist[a] ?? 0) + 1;
+     c.style = sz[c.id];
+     final pct = (_TasteModel.sig(p.model.logit(_featsOf(c.id, c.q))) * 100)
+     .round();
+     c.label = '${c.reason} · 취향 $pct%${_stylePct(c)}';
+     picks.add(c);
+     return true;
+     }
+     for (final src in const [0, 1, 2]) {
+     if (picks.length >= 3) break;
+     for (final e in ranked) {
+     if (e.$3 == src && tryAdd(e.$1)) break;
+     }
+     }
+     for (final e in ranked) {
+     if (picks.length >= 3) break;
+     tryAdd(e.$1);
+     }
+     final at = _results.indexOf(liked);
+     setState(() {
+     _expanding.remove(liked.id);
+     if (at >= 0 && picks.isNotEmpty) _results.insertAll(at + 1, picks);
+     });
+     for (final c in picks) {
+     _shownIds.add(c.id);
+     _seenOrder.add(c.id);
+     p.pool.remove(c.id);
+     final tk = _titleKey(c.q);
+     if (tk.isNotEmpty && _seenTitles.add(tk)) _seenTitleOrder.add(tk);
+     }
+     if (picks.isNotEmpty) {
+     _saveSeen();
+     } else {
+     ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+     const SnackBar(
+     duration: Duration(milliseconds: 2500),
+     content: Text('비슷한 새 작품은 지금 못 찾았어요. 다음 뽑기에 반영할게요.'),
+     ),
+     );
+     }
      }
      String _langKo(String lang) =>
      const {
@@ -1626,10 +2467,27 @@ jobs:
      }
      String _featLabel(String k) {
      final v = k.length > 2 ? k.substring(2).replaceAll('_', ' ') : k;
-     if (k.startsWith('g:')) return '$v(그룹)';
-     if (k.startsWith('s:')) return '$v(시리즈)';
-     if (k.startsWith('c:')) return '$v(캐릭터)';
+     if (k.startsWith('a:')) return '작가 $v';
+     if (k.startsWith('g:')) return '그룹 $v';
+     if (k.startsWith('s:')) return '시리즈 ${_tr('series', v)}';
+     if (k.startsWith('c:')) return '캐릭터 ${_tr('character', v)}';
+     if (k.startsWith('t:')) {
+     final i = v.indexOf(':');
+     final group = i >= 0 ? v.substring(0, i) : 'tag';
+     final name = i >= 0 ? v.substring(i + 1) : v;
+     final mark = group == 'female' ? '♀' : (group == 'male' ? '♂' : '');
+     return '#$mark${_tr(group, name)}';
+     }
      return v;
+     }
+     String _tr(String group, String name) {
+     if (!Settings.translateTags.value) return name;
+     try {
+     final t = TagTranslate.of(group, name).trim();
+     return t.isEmpty ? name : t;
+     } catch (_) {
+     return name;
+     }
      }
      List<String> _topTokens(_Profile p, int n) {
      final entries = p.weights.entries.toList()
@@ -1657,6 +2515,13 @@ jobs:
      _modeChip('내 취향', _Mode.taste),
      const SizedBox(width: 8),
      _modeChip('최근 본 작품', _Mode.recent),
+     const Spacer(),
+     if (_styleAvail)
+     FilterChip(
+     label: const Text('그림체'),
+     selected: _styleOn,
+     onSelected: (v) => _setStyleOn(v),
+     ),
      ],
      ),
      ),
@@ -1714,6 +2579,256 @@ jobs:
      },
      );
      }
+     bool get _styleReady => _styleOn && _styleAvail && _stylePos.length >= 8;
+     Future<void> _styleInit() async {
+     try {
+     await _Style.load();
+     _styleAvail = await _Style.available();
+     } catch (_) {
+     _styleAvail = false;
+     }
+     }
+     void _rebuildStyleSets() {
+     _stylePos.clear();
+     _styleNeg.clear();
+     void addPos(int id, double w) {
+     final e = _Style.emb[id];
+     if (e != null) _stylePos.add((e, w));
+     }
+     void addNeg(int id, double w) {
+     final e = _Style.emb[id];
+     if (e != null) _styleNeg.add((e, w));
+     }
+     final seen = <int>{};
+     _feedback.forEach((id, v) {
+     seen.add(id);
+     if (v > 0) {
+     addPos(id, 2.0);
+     } else {
+     addNeg(id, 2.0);
+     }
+     });
+     for (final id in _bookmarkMetas.keys) {
+     if (seen.add(id)) addPos(id, 1.0);
+     }
+     for (final id in _recentReadIds.take(300)) {
+     if (!seen.add(id)) continue;
+     final g = _engagement(id);
+     if (g > 0) addPos(id, 0.7);
+     if (g < 0) addNeg(id, 0.5);
+     }
+     }
+     Future<void> _buildStyleProfile() async {
+     if (_styleBusy) return;
+     _styleBusy = true;
+     try {
+     await _Style.load();
+     _styleAvail = await _Style.available();
+     if (!_styleAvail) return;
+     final pos = <int, QueryResult>{};
+     final neg = <int, QueryResult>{};
+     _feedback.forEach((id, v) {
+     final q = _fbMetas[id];
+     if (q == null) return;
+     if (v > 0) {
+     pos[id] = q;
+     } else {
+     neg[id] = q;
+     }
+     });
+     final bms = _bookmarkMetas.entries.toList()..shuffle(_rand);
+     for (final e in bms.take(120)) {
+     pos.putIfAbsent(e.key, () => e.value);
+     }
+     var engaged = 0;
+     var bounced = 0;
+     for (final id in _recentReadIds.take(300)) {
+     final q = _readMetas[id];
+     if (q == null) continue;
+     final g = _engagement(id);
+     if (g > 0 && engaged < 40) {
+     pos.putIfAbsent(id, () => q);
+     engaged++;
+     } else if (g < 0 && bounced < 30) {
+     neg.putIfAbsent(id, () => q);
+     bounced++;
+     }
+     }
+     final todo = [
+     for (final e in [...pos.entries, ...neg.entries])
+     if (!_Style.complete(e.key)) e,
+     ];
+     _styleTotal = todo.length;
+     _styleDone = 0;
+     if (mounted) setState(() {});
+     for (var i = 0; i < todo.length; i += 6) {
+     if (!mounted || !_styleOn) break;
+     await Future.wait([
+     for (final e in todo.skip(i).take(6)) _Style.of(e.key, e.value),
+     ]);
+     _styleDone = min(todo.length, i + 6);
+     if (_styleDone % 30 == 0) {
+     _rebuildStyleSets();
+     _Style.save();
+     }
+     if (mounted) setState(() {});
+     }
+     _rebuildStyleSets();
+     await _Style.save();
+     } catch (_) {
+     } finally {
+     _styleBusy = false;
+     _styleTotal = 0;
+     if (mounted) setState(() {});
+     }
+     }
+     double? _styleRaw(_Sv e) {
+     if (_stylePos.length < 8) return null;
+     double topMean(List<(_Sv, double)> items, int k) {
+     final sims = [
+     for (final (v, w) in items) _Style.sim(e, v) * (w >= 2 ? 1.05 : 1.0),
+     ]..sort((a, b) => b.compareTo(a));
+     final n = min(k, sims.length);
+     if (n == 0) return 0.0;
+     var s = 0.0;
+     for (var i = 0; i < n; i++) {
+     s += sims[i];
+     }
+     return s / n;
+     }
+     final pos = topMean(_stylePos, 5);
+     final neg = _styleNeg.length >= 3 ? topMean(_styleNeg, 3) : 0.0;
+     return pos - 0.5 * neg;
+     }
+     Map<int, double> _styleZ(Iterable<_Cand> list) {
+     final raw = <int, double>{};
+     for (final c in list) {
+     final e = _Style.emb[c.id];
+     if (e == null) continue;
+     final r = _styleRaw(e);
+     if (r != null) raw[c.id] = r;
+     }
+     if (raw.length < 4) return const {};
+     final vals = raw.values.toList();
+     final mean = vals.reduce((a, b) => a + b) / vals.length;
+     var v2 = 0.0;
+     for (final x in vals) {
+     v2 += (x - mean) * (x - mean);
+     }
+     final sd = sqrt(v2 / vals.length);
+     if (sd < 1e-6) return const {};
+     return {
+     for (final e in raw.entries)
+     e.key: ((e.value - mean) / sd).clamp(-2.5, 2.5).toDouble(),
+     };
+     }
+     String _stylePct(_Cand c) {
+     final s = c.style;
+     if (s == null) return '';
+     return ' · 그림체 ${(_TasteModel.sig(1.3 * s) * 100).round()}%';
+     }
+     Future<void> _ensureStyle(List<_Cand> list, Duration budget) async {
+     final need = [
+     for (final c in list)
+     if (!_Style.complete(c.id)) c,
+     ];
+     if (need.isEmpty) return;
+     try {
+     await Future.wait([
+     for (final c in need) _Style.of(c.id, c.q),
+     ]).timeout(budget);
+     } catch (_) {}
+     _Style.save();
+     }
+     Future<void> _prefetchStyle(_Profile p) async {
+     final list = <(_Cand, double)>[];
+     for (final c in p.pool.values) {
+     if (!_isNew(c.id) || _Style.complete(c.id)) continue;
+     list.add((c, p.model.logit(_featsOf(c.id, c.q)) + c.bonus));
+     }
+     if (list.isEmpty) return;
+     list.sort((a, b) => b.$2.compareTo(a.$2));
+     await _ensureStyle(
+     list.take(30).map((e) => e.$1).toList(),
+     const Duration(seconds: 90),
+     );
+     }
+     Future<void> _setStyleOn(bool v) async {
+     setState(() => _styleOn = v);
+     try {
+     final prefs = await SharedPreferences.getInstance();
+     await prefs.setBool(_kStyleOnKey, v);
+     } catch (_) {}
+     if (v && !_styleBusy) _buildStyleProfile();
+     }
+     Future<void> _styleFeedback(_Cand c) async {
+     if (!_styleAvail) return;
+     await _Style.of(c.id, c.q);
+     _rebuildStyleSets();
+     _Style.save();
+     if (mounted) setState(() {});
+     }
+     Future<void> _loadHelp() async {
+     try {
+     final prefs = await SharedPreferences.getInstance();
+     _helpSeen = prefs.getBool(_kHelpKey) ?? false;
+     _styleOn = prefs.getBool(_kStyleOnKey) ?? true;
+     } catch (_) {}
+     }
+     Future<void> _closeHelp() async {
+     setState(() => _helpSeen = true);
+     try {
+     final prefs = await SharedPreferences.getInstance();
+     await prefs.setBool(_kHelpKey, true);
+     } catch (_) {}
+     }
+     void _showHelp() {
+     showDialog<void>(
+     context: context,
+     builder: (ctx) => AlertDialog(
+     title: const Text('AI 추천은 이렇게 써요'),
+     content: const SingleChildScrollView(
+     child: Text(_kHelpText, style: TextStyle(height: 1.4)),
+     ),
+     actions: [
+     TextButton(
+     onPressed: () => Navigator.of(ctx).pop(),
+     child: const Text('알겠어요'),
+     ),
+     ],
+     ),
+     );
+     }
+     Widget _helpCard(BuildContext context) {
+     final accent = Settings.majorColor.value;
+     return Container(
+     width: double.infinity,
+     margin: const EdgeInsets.only(bottom: 8),
+     padding: const EdgeInsets.fromLTRB(12, 10, 8, 2),
+     decoration: BoxDecoration(
+     border: Border.all(color: accent.withValues(alpha: 0.5)),
+     borderRadius: BorderRadius.circular(10),
+     ),
+     child: Column(
+     crossAxisAlignment: CrossAxisAlignment.start,
+     children: [
+     Text(
+     'AI 추천은 이렇게 써요',
+     style: TextStyle(fontWeight: FontWeight.w700, color: accent),
+     ),
+     const SizedBox(height: 6),
+     const Text(_kHelpText, style: TextStyle(fontSize: 13, height: 1.4)),
+     Align(
+     alignment: Alignment.centerRight,
+     child: TextButton(
+     onPressed: _closeHelp,
+     child: const Text('알겠어요'),
+     ),
+     ),
+     ],
+     ),
+     );
+     }
      Widget _header(BuildContext context) {
      final p = _p;
      final hintColor = Theme.of(context).hintColor;
@@ -1750,10 +2865,12 @@ jobs:
      } else if (_mode == _Mode.taste && _anTags.isNotEmpty) {
      lines.add(
      '· 좋아하는 태그: '
-     '${_anTags.take(6).map((e) => e.$2 > 0 ? '${e.$1} ${e.$2}%' : e.$1).join(', ')}',
+     '${_anTags.take(6).map((e) => e.$2 > 0 ? '${_featLabel('t:${e.$1}')} ${e.$2}%' : _featLabel('t:${e.$1}')).join(', ')}',
      );
      } else if (_mode == _Mode.recent && p.weights.isNotEmpty) {
-     lines.add('· 요즘 자주 본 태그: ${_topTokens(p, 8).join(', ')}');
+     lines.add(
+     '· 요즘 자주 본 태그: ${_topTokens(p, 8).map((t) => _featLabel('t:$t')).join(', ')}',
+     );
      }
      if (goodOthers.isNotEmpty) {
      lines.add('· 좋아하는 작가·시리즈: ${goodOthers.join(', ')}');
@@ -1763,7 +2880,9 @@ jobs:
      }
      if (_mode == _Mode.taste) {
      if (_anFavTags.isNotEmpty) {
-     lines.add('· 즐겨찾는 작가들의 공통 태그: ${_anFavTags.join(', ')}');
+     lines.add(
+     '· 즐겨찾는 작가들의 공통 태그: ${_anFavTags.map((t) => _featLabel('t:$t')).join(', ')}',
+     );
      }
      if (_anArtists.isNotEmpty) {
      lines.add(
@@ -1781,6 +2900,21 @@ jobs:
      lines.add('· 보통 $_anPages쪽 정도 되는 작품을 봐요.');
      }
      }
+     if (_styleAvail) {
+     if (!_styleOn) {
+     lines.add("· 그림체 분석이 꺼져 있어요. 위쪽 '그림체'를 누르면 켜져요.");
+     } else if (_styleBusy && _styleTotal > 0) {
+     lines.add(
+     '· 그림체 분석 중... 작품 $_styleDone/$_styleTotal개 (표지와 본문 3장씩, 처음 한 번만 오래 걸려요)',
+     );
+     } else if (_stylePos.length >= 8) {
+     lines.add(
+     '· 그림체: 좋아한 작품 ${_stylePos.length}개의 표지와 본문 그림을 기준으로, 그림체가 비슷한 작품을 더 올려 줘요.',
+     );
+     } else {
+     lines.add('· 그림체: 아직 분석한 작품이 적어요. 👍를 누르거나 북마크하면 늘어나요.');
+     }
+     }
      if (p.similar.isNotEmpty) {
      lines.add(
      '· 내 취향과 맞는 비슷한 작가: '
@@ -1792,7 +2926,7 @@ jobs:
      lines.add('· 작가 페이지에서 하트를 눌러 작가를 즐겨찾기하면, 그 작가와 비슷한 작가 작품도 추천돼요.');
      }
      if (_feedback.isEmpty) {
-     lines.add('· 작품마다 오른쪽 위 👍/👎를 누르면 AI가 바로 배워서 다음 추천에 반영해요.');
+     lines.add('· 👍/👎를 누를수록 추천이 내 취향에 맞춰져요. 쓰는 법은 오른쪽 ⓘ를 눌러 보세요.');
      }
      return Padding(
      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
@@ -1805,6 +2939,7 @@ jobs:
      Text('다음 추천에 쓸 작품을 미리 모으는 중...', style: hint),
      const SizedBox(height: 6),
      ],
+     if (!_helpSeen) _helpCard(context),
      InkWell(
      onTap: () => setState(() => _showAnalysis = !_showAnalysis),
      child: Padding(
@@ -1822,6 +2957,15 @@ jobs:
      _mode == _Mode.taste ? 'AI 취향 분석' : 'AI 요즘 취향 분석',
      style: hint.copyWith(fontWeight: FontWeight.w700),
      ),
+     ),
+     if (likes + dislikes > 0)
+     Text('👍 $likes · 👎 $dislikes', style: hint),
+     IconButton(
+     tooltip: '쓰는 법',
+     visualDensity: VisualDensity.compact,
+     iconSize: 18,
+     onPressed: _showHelp,
+     icon: Icon(Icons.info_outline, color: hintColor),
      ),
      Icon(
      _showAnalysis ? Icons.expand_less : Icons.expand_more,
@@ -1869,7 +3013,7 @@ jobs:
      ),
      ),
      IconButton(
-     tooltip: '좋아요',
+     tooltip: '좋아요 (비슷한 작품 더 보기)',
      visualDensity: VisualDensity.compact,
      iconSize: 18,
      onPressed: () => _onFeedback(c, 1),
@@ -1879,7 +3023,7 @@ jobs:
      ),
      ),
      IconButton(
-     tooltip: '별로예요',
+     tooltip: '별로예요 (이런 작품 덜 보기)',
      visualDensity: VisualDensity.compact,
      iconSize: 18,
      onPressed: () => _onFeedback(c, -1),
@@ -1887,6 +3031,24 @@ jobs:
      fb < 0 ? Icons.thumb_down : Icons.thumb_down_outlined,
      color: fb < 0 ? accent : hintColor,
      ),
+     ),
+     ],
+     ),
+     ),
+     if (_expanding.contains(c.id))
+     Padding(
+     padding: const EdgeInsets.fromLTRB(14, 0, 14, 4),
+     child: Row(
+     children: [
+     const SizedBox(
+     width: 12,
+     height: 12,
+     child: CircularProgressIndicator(strokeWidth: 2),
+     ),
+     const SizedBox(width: 8),
+     Text(
+     '비슷한 작품 찾는 중...',
+     style: TextStyle(color: hintColor, fontSize: 12),
      ),
      ],
      ),
@@ -2052,6 +3214,196 @@ jobs:
          open(v, 'w', encoding='utf-8').write(s.replace(old, new))
          print(v, 'stack patched')
      PY
+  - name: Add style analysis
+    if: steps.chk.outputs.ok == '1'
+    run: |
+     # 그림체 분석: 작은 이미지 AI 모델(MobileNet V3, 약 4MB)을 앱에 넣어요.
+     M=android/app/src/main/assets/violet_style.tflite
+     mkdir -p android/app/src/main/assets
+     rm -f "$M"
+     for u in \
+       "https://huggingface.co/litert-community/MediaPipe-ImageEmbedder-MobileNet-V3-Small/resolve/main/mobilenet_v3_small.tflite" \
+       "https://storage.googleapis.com/mediapipe-models/image_embedder/mobilenet_v3_small/float32/latest/mobilenet_v3_small.tflite"; do
+       if curl -fsSL --retry 3 --max-time 180 -o "$M" "$u" && [ "$(stat -c %s "$M" 2>/dev/null || echo 0)" -gt 100000 ]; then
+         echo "그림체 모델 받음: $u"
+         break
+       fi
+       rm -f "$M"
+     done
+     if [ ! -s "$M" ]; then
+       echo "그림체 모델을 못 받아서 이번엔 그림체 분석 없이 만들어요"
+       exit 0
+     fi
+     sha256sum "$M"
+     MA=$(find android/app/src/main -name MainActivity.kt | head -n 1)
+     if [ -z "$MA" ]; then
+       rm -f "$M"
+       echo "MainActivity.kt 를 못 찾아서 그림체 분석은 빼요"
+       exit 0
+     fi
+     PKG=$(grep -m1 -E '^package ' "$MA" | awk '{print $2}')
+     KT="$(dirname "$MA")/VioletStyle.kt"
+     # 빌드가 실패하면 그림체 없이 다시 만들 수 있게 원래 파일을 보관해요.
+     B="$RUNNER_TEMP/style_backup"
+     rm -rf "$B"
+     mkdir -p "$B"
+     cp "$MA" "$B/MainActivity.kt"
+     cp android/app/build.gradle.kts "$B/build.gradle.kts"
+     cp android/app/proguard-rules.pro "$B/proguard-rules.pro"
+     echo "$MA" > "$B/ma_path"
+     echo "$KT" > "$B/kt_path"
+     cat > "$KT" <<'KOTLIN'
+     package __PKG__
+
+     import android.content.Context
+     import android.graphics.Bitmap
+     import android.graphics.BitmapFactory
+     import android.os.Handler
+     import android.os.Looper
+     import com.google.mediapipe.framework.image.BitmapImageBuilder
+     import com.google.mediapipe.tasks.core.BaseOptions
+     import com.google.mediapipe.tasks.vision.imageembedder.ImageEmbedder
+     import io.flutter.plugin.common.MethodCall
+     import io.flutter.plugin.common.MethodChannel
+     import java.util.concurrent.Executors
+
+     // [AI 추천] 그림체 분석: 표지 그림을 작은 이미지 AI(MobileNet V3)로 '그림 지문'으로 바꿔요.
+     object VioletStyle {
+         private const val MODEL = "violet_style.tflite"
+         private val worker = Executors.newSingleThreadExecutor()
+         private val main = Handler(Looper.getMainLooper())
+         private var embedder: ImageEmbedder? = null
+         private var failed = false
+
+         private fun get(ctx: Context): ImageEmbedder? {
+             if (embedder != null || failed) return embedder
+             try {
+                 val base = BaseOptions.builder().setModelAssetPath(MODEL).build()
+                 val options = ImageEmbedder.ImageEmbedderOptions.builder()
+                     .setBaseOptions(base)
+                     .build()
+                 embedder = ImageEmbedder.createFromOptions(ctx, options)
+             } catch (t: Throwable) {
+                 failed = true
+             }
+             return embedder
+         }
+
+         private fun embed(ctx: Context, bytes: ByteArray): ByteArray? {
+             val e = get(ctx) ?: return null
+             val src = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+             val bmp = if (src.config == Bitmap.Config.ARGB_8888) src else src.copy(Bitmap.Config.ARGB_8888, false)
+             try {
+                 val result = e.embed(BitmapImageBuilder(bmp).build())
+                 val emb = result.embeddingResult().embeddings().firstOrNull() ?: return null
+                 val f = emb.floatEmbedding()
+                 if (f == null || f.isEmpty()) {
+                     val q = emb.quantizedEmbedding()
+                     return if (q == null || q.isEmpty()) null else q
+                 }
+                 var mx = 0f
+                 for (x in f) {
+                     val a = Math.abs(x)
+                     if (a > mx) mx = a
+                 }
+                 if (mx <= 0f) return null
+                 return ByteArray(f.size) { i -> Math.round(f[i] / mx * 127f).coerceIn(-127, 127).toByte() }
+             } finally {
+                 if (bmp !== src) bmp.recycle()
+                 src.recycle()
+             }
+         }
+
+         fun handle(ctx: Context, call: MethodCall, result: MethodChannel.Result) {
+             when (call.method) {
+                 "available" -> worker.execute {
+                     val ok = try { get(ctx) != null } catch (t: Throwable) { false }
+                     main.post { result.success(ok) }
+                 }
+                 "embed" -> {
+                     val bytes = call.argument<ByteArray>("bytes")
+                     if (bytes == null) {
+                         result.success(null)
+                         return
+                     }
+                     worker.execute {
+                         val out = try { embed(ctx, bytes) } catch (t: Throwable) { null }
+                         main.post { result.success(out) }
+                     }
+                 }
+                 else -> result.notImplemented()
+             }
+         }
+     }
+     KOTLIN
+     sed -i "s/^package __PKG__\$/package $PKG/" "$KT"
+     if python3 - "$MA" "$KT" "$M" <<'PY'
+     import os
+     import sys
+
+     ma, kt, model = sys.argv[1:4]
+     s = open(ma, encoding='utf-8').read()
+     anchor = 'GeneratedPluginRegistrant.registerWith(flutterEngine)\n'
+     add = (
+         '        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "xyz.project.violet/style").setMethodCallHandler { call, result ->\n'
+         '            VioletStyle.handle(applicationContext, call, result)\n'
+         '        }\n'
+     )
+     if 'VioletStyle.handle' not in s:
+         if anchor not in s or 'import io.flutter.plugin.common.MethodChannel\n' not in s:
+             print('MainActivity 모양이 달라서 그림체 분석은 빼요')
+             sys.exit(3)
+         s = s.replace(anchor, anchor + add, 1)
+         open(ma, 'w', encoding='utf-8').write(s)
+     g = 'android/app/build.gradle.kts'
+     t = open(g, encoding='utf-8').read()
+     if 'tasks-vision' not in t:
+         t += '''
+     dependencies {
+         implementation("com.google.mediapipe:tasks-vision:0.10.26")
+     }
+
+     android {
+         androidResources {
+             noCompress += listOf("tflite")
+         }
+         packaging {
+             jniLibs {
+                 pickFirsts += listOf("**/libc++_shared.so")
+             }
+         }
+     }
+     '''
+         open(g, 'w', encoding='utf-8').write(t)
+     pr = 'android/app/proguard-rules.pro'
+     r = open(pr, encoding='utf-8').read()
+     if 'com.google.mediapipe' not in r:
+         r += '''
+     -keep class com.google.mediapipe.** { *; }
+     -dontwarn com.google.mediapipe.**
+     -keep class com.google.protobuf.** { *; }
+     -dontwarn com.google.protobuf.**
+     -keep class com.google.common.flogger.** { *; }
+     -dontwarn com.google.common.**
+     -dontwarn com.google.auto.value.**
+     -dontwarn javax.annotation.**
+     -dontwarn javax.lang.model.**
+     -dontwarn org.checkerframework.**
+     -dontwarn com.google.errorprone.annotations.**
+     -dontwarn com.google.j2objc.annotations.**
+     '''
+         open(pr, 'w', encoding='utf-8').write(r)
+     PY
+     then
+       touch "$B/applied"
+       echo "그림체 분석 추가 완료"
+     else
+       cp "$B/MainActivity.kt" "$MA"
+       cp "$B/build.gradle.kts" android/app/build.gradle.kts
+       cp "$B/proguard-rules.pro" android/app/proguard-rules.pro
+       rm -f "$KT" "$M"
+       echo "그림체 분석은 이번엔 빼요"
+     fi
   - name: Use the official Rust library
     id: rust
     if: steps.chk.outputs.ok == '1'
@@ -2239,6 +3591,7 @@ jobs:
     run: |
      printf 'storePassword=violetlite\nkeyPassword=violetlite\nkeyAlias=violet\nstoreFile=%s\n' "$GITHUB_WORKSPACE/violet/android/build-key.jks" > android/key.properties
   - name: Build APK (arm64)
+    id: build
     if: steps.chk.outputs.ok == '1'
     env:
      VIOLET_PREBUILT_RUST: ${{ steps.rust.outputs.dir }}
@@ -2246,19 +3599,21 @@ jobs:
      set -o pipefail
      if [ -n "$VIOLET_PREBUILT_RUST" ]; then echo "Rust: 공식 라이브러리를 그대로 써요"; else echo "Rust: 직접 만들어요 (몇 분 더 걸려요)"; fi
      LOG="$RUNNER_TEMP/build.log"
-     if ! { flutter pub get && flutter build apk --release --target-platform android-arm64; } 2>&1 | tee "$LOG"; then
-       python3 -I - "$LOG" <<'PY'
+     ERR="$RUNNER_TEMP/errors.py"
+     cat > "$ERR" <<'PY'
      import os
      import re
      import subprocess
      import sys
 
      lines = open(sys.argv[1], encoding='utf-8', errors='replace').read().splitlines()
+     level = sys.argv[2] if len(sys.argv) > 2 else 'error'
+     title = '빌드 실패 원인' if level == 'error' else '그림체 분석 쪽 빌드 실패 (그림체 없이 다시 만들어요)'
      ansi = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
      pat = re.compile(
          r'error(\[E\d+\])?:|: Error:|\bERROR:|^e: |Missing class|undefined symbol|'
          r'No space left|SIGKILL|signal: 9|Could not resolve|Could not find|Out of memory|OutOfMemory|'
-         r'What went wrong|^\s*--> ',
+         r'Duplicate class|What went wrong|^\s*--> ',
          re.I,
      )
      picked, seen, after = [], set(), 0
@@ -2292,22 +3647,45 @@ jobs:
 
      body = '\n'.join(picked)
      msg = body.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-     print('::error title=빌드 실패 원인::' + msg)
+     print(f'::{level} title={title}::' + msg)
      summary = os.environ.get('GITHUB_STEP_SUMMARY')
      if summary:
          with open(summary, 'a', encoding='utf-8') as f:
-             f.write('## 빌드 실패 원인\n\n이 화면을 캡처해서 보내 주세요.\n\n```text\n')
+             f.write(f'## {title}\n\n이 화면을 캡처해서 보내 주세요.\n\n```text\n')
              f.write(body + '\n```\n\n')
              f.write('```text\n' + run(['df', '-h', '/']) + '\n\n' + run(['free', '-h']) + '\n```\n')
      PY
+     build() {
+       { flutter pub get && flutter build apk --release --target-platform android-arm64; } 2>&1 | tee "$LOG"
+     }
+     if build; then
+       exit 0
+     fi
+     B="$RUNNER_TEMP/style_backup"
+     if [ ! -f "$B/applied" ]; then
+       python3 -I "$ERR" "$LOG" error
        exit 1
      fi
+     # 그림체 분석(새로 넣은 부분) 때문일 수 있어서, 그 부분만 빼고 한 번 더 만들어요.
+     python3 -I "$ERR" "$LOG" warning
+     echo "그림체 분석 없이 다시 만들어요"
+     cp "$B/MainActivity.kt" "$(cat "$B/ma_path")"
+     cp "$B/build.gradle.kts" android/app/build.gradle.kts
+     cp "$B/proguard-rules.pro" android/app/proguard-rules.pro
+     rm -f "$(cat "$B/kt_path")" android/app/src/main/assets/violet_style.tflite "$B/applied"
+     if build; then
+       echo "style_dropped=1" >> "$GITHUB_OUTPUT"
+       exit 0
+     fi
+     python3 -I "$ERR" "$LOG" error
+     exit 1
   - name: Publish APK to Releases
     if: steps.chk.outputs.ok == '1'
     env:
      GH_TOKEN: ${{ github.token }}
      SRC_TAG: ${{ steps.src.outputs.tag }}
+     STYLE_NOTE: ${{ steps.build.outputs.style_dropped == '1' && ' · 그림체 분석 빠짐' || '' }}
     run: |
      cp build/app/outputs/flutter-apk/app-release.apk violet-ai.apk
      gh release delete ai-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
-     gh release create ai-latest violet-ai.apk --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Violet AI 추천 + 번역 ($SRC_TAG)" --notes "원본 $SRC_TAG · 빌드 번호 $GITHUB_RUN_NUMBER"
+     gh release create ai-latest violet-ai.apk --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Violet AI 추천 + 번역 ($SRC_TAG)" --notes "원본 $SRC_TAG · 빌드 번호 $GITHUB_RUN_NUMBER$STYLE_NOTE"
