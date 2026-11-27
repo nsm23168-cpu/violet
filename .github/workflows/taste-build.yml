@@ -49,6 +49,7 @@ jobs:
      import 'dart:io';
      import 'dart:math';
      import 'dart:typed_data';
+     import 'package:connectivity_plus/connectivity_plus.dart';
      import 'package:flutter/foundation.dart' show compute;
      import 'package:flutter/material.dart';
      import 'package:flutter/services.dart';
@@ -102,9 +103,14 @@ jobs:
      static bool? _ok;
      static final Map<int, _Sv> emb = {};
      static final Set<int> _tried = {}; // 앱을 켠 동안 이미 분석해 본 작품
-     static bool _loaded = false;
-     static bool _dirty = false;
+     static Set<int> keep = {}; // 저장 공간이 모자라도 지우지 않을 작품 (👍, 북마크 등)
+     static Future<void>? _loading;
+     static final Set<int> _pending = {}; // 아직 파일에 안 쓴 작품
+     static bool _rewrite = false; // 파일을 처음부터 다시 써야 할 때
+     static int _records = 0; // 파일 안의 기록 수
+     static Future<void> _saving = Future<void>.value();
      static int _active = 0;
+     static int _slots = 3;
      static final List<Completer<void>> _waiters = [];
      static Future<bool> available() async {
      final known = _ok;
@@ -125,8 +131,21 @@ jobs:
      final v = emb[id];
      return v != null && v.cover != null && v.inner != null;
      }
+     static void setSlow(bool slow) {
+     final n = slow ? 1 : 3;
+     if (n == _slots) return;
+     _slots = n;
+     _wakeAll();
+     }
+     static void _wakeAll() {
+     final w = List<Completer<void>>.of(_waiters);
+     _waiters.clear();
+     for (final c in w) {
+     c.complete();
+     }
+     }
      static Future<T> _limit<T>(Future<T> Function() job) async {
-     while (_active >= 3) {
+     while (_active >= _slots) {
      final c = Completer<void>();
      _waiters.add(c);
      await c.future;
@@ -136,7 +155,7 @@ jobs:
      return await job();
      } finally {
      _active--;
-     if (_waiters.isNotEmpty) _waiters.removeAt(0).complete();
+     _wakeAll();
      }
      }
      static Future<Int8List?> _embedUrl(
@@ -188,7 +207,7 @@ jobs:
      }
      return out;
      }
-     static Future<_Sv?> of(int id, QueryResult q) async {
+     static Future<_Sv?> of(int id, QueryResult? q) async {
      if (complete(id) || !await available()) return emb[id];
      return _limit<_Sv?>(() async {
      if (complete(id)) return emb[id];
@@ -203,7 +222,7 @@ jobs:
      final v = emb[id] ?? _Sv(null, null);
      if (v.cover == null) {
      String? url;
-     final t = q.thumbnail();
+     final t = q?.thumbnail();
      if (t is String && t.trim().isNotEmpty) {
      final s = t.trim();
      url = s.startsWith('//') ? 'https:$s' : s;
@@ -228,6 +247,8 @@ jobs:
      for (final x in vecs)
      if (x != null) x,
      ]);
+     } else if (v.inner == null && pages.length == 1) {
+     v.inner = v.cover; // 한 장짜리 작품은 표지가 곧 본문이에요.
      }
      _tried.add(id);
      if (v.cover == null && v.inner == null) {
@@ -235,7 +256,7 @@ jobs:
      return null;
      }
      emb[id] = v;
-     _dirty = true;
+     _pending.add(id);
      return v;
      } catch (_) {
      _tried.add(id);
@@ -283,15 +304,15 @@ jobs:
      return null;
      }
      }
-     static Future<void> load() async {
-     if (_loaded) return;
-     _loaded = true;
+     static Future<void> load() => _loading ??= _load();
+     static Future<void> _load() async {
      try {
      final f2 = await _file('ai_style_v2.bin');
      if (f2 != null && await f2.exists()) {
      final b = await f2.readAsBytes();
      final bd = ByteData.sublistView(b);
      var o = 0;
+     var count = 0;
      while (o + 7 <= b.length) {
      final id = bd.getUint32(o, Endian.little);
      final flags = b[o + 4];
@@ -309,8 +330,11 @@ jobs:
      inner = Int8List.fromList(b.sublist(o, o + n));
      o += n;
      }
-     emb[id] = _Sv(cover, inner);
+     if (cover != null || inner != null) emb[id] = _Sv(cover, inner);
+     count++;
      }
+     _records = count;
+     if (o != b.length || count > emb.length * 2 + 500) _rewrite = true;
      return;
      }
      final f1 = await _file('ai_style_v1.bin');
@@ -326,30 +350,30 @@ jobs:
      emb[id] = _Sv(Int8List.fromList(b.sublist(o, o + n)), null);
      o += n;
      }
-     _dirty = true;
+     _rewrite = true;
      } catch (_) {}
      }
-     static Future<void> save() async {
-     if (!_dirty) return;
-     _dirty = false;
-     try {
-     while (emb.length > 4000) {
-     emb.remove(emb.keys.first);
-     }
+     static Uint8List _encode(Iterable<int> ids) {
+     final parts = <(int, Int8List?, Int8List?, int)>[];
      var total = 0;
-     for (final v in emb.values) {
-     total += 7 + (v.cover?.length ?? 0) + (v.inner?.length ?? 0);
+     for (final id in ids) {
+     final v = emb[id];
+     if (v == null) continue;
+     final c = v.cover;
+     final i = v.inner;
+     final n = c?.length ?? i?.length ?? 0;
+     if (n <= 0 || n > 65535) continue;
+     if ((c != null && c.length != n) || (i != null && i.length != n)) {
+     continue;
+     }
+     parts.add((id, c, i, n));
+     total += 7 + (c != null ? n : 0) + (i != null ? n : 0);
      }
      final out = Uint8List(total);
      final bd = ByteData.sublistView(out);
      var o = 0;
-     for (final e in emb.entries) {
-     final c = e.value.cover;
-     final i = e.value.inner;
-     final n = c?.length ?? i?.length ?? 0;
-     final ok = n > 0 && (c == null || c.length == n) && (i == null || i.length == n);
-     if (!ok) continue;
-     bd.setUint32(o, e.key, Endian.little);
+     for (final (id, c, i, n) in parts) {
+     bd.setUint32(o, id, Endian.little);
      out[o + 4] = (c != null ? 1 : 0) | (i != null ? 2 : 0);
      bd.setUint16(o + 5, n, Endian.little);
      o += 7;
@@ -361,11 +385,140 @@ jobs:
      o += n;
      }
      }
+     return out;
+     }
+     static Future<void> save() {
+     final next = _saving.then((_) => _save());
+     _saving = next;
+     return next;
+     }
+     static Future<void> _save() async {
+     if (!_rewrite && _pending.isEmpty) return;
+     try {
      final f = await _file('ai_style_v2.bin');
      if (f == null) return;
-     await f.writeAsBytes(Uint8List.sublistView(out, 0, o), flush: true);
+     final cap = min(12000, max(4000, keep.length + 1500));
+     if (emb.length > cap) {
+     final drop = [
+     for (final id in emb.keys)
+     if (!keep.contains(id)) id,
+     ].take(emb.length - cap).toList();
+     for (final id in drop) {
+     emb.remove(id);
+     }
+     while (emb.length > cap) {
+     emb.remove(emb.keys.first);
+     }
+     _rewrite = true;
+     }
+     if (_rewrite || !await f.exists()) {
+     _rewrite = false;
+     _pending.clear();
+     final bytes = _encode(emb.keys.toList());
+     final tmp = File('${f.path}.tmp');
+     await tmp.writeAsBytes(bytes, flush: true);
+     await tmp.rename(f.path);
+     _records = emb.length;
+     return;
+     }
+     final ids = _pending.toList();
+     _pending.clear();
+     final bytes = _encode(ids);
+     if (bytes.isEmpty) return;
+     await f.writeAsBytes(bytes, mode: FileMode.append, flush: true);
+     _records += ids.length;
+     if (_records > emb.length * 2 + 500) _rewrite = true;
      } catch (_) {}
      }
+     }
+     class _StyleJob {
+     _StyleJob(this.pos, this.posW, this.neg, this.negW, this.cand);
+     final List<_Sv> pos;
+     final List<double> posW; // 👍한 작품(2)은 조금 더 크게 봐요
+     final List<_Sv> neg;
+     final List<double> negW;
+     final List<_Sv> cand;
+     }
+     Float32x4List? _unit4(Int8List? v) {
+     if (v == null || v.isEmpty) return null;
+     var norm = 0.0;
+     for (var i = 0; i < v.length; i++) {
+     norm += v[i] * v[i];
+     }
+     if (norm <= 0) return null;
+     final inv = 1 / sqrt(norm);
+     final out = Float32x4List((v.length + 3) ~/ 4);
+     final f = out.buffer.asFloat32List(out.offsetInBytes, out.length * 4);
+     for (var i = 0; i < v.length; i++) {
+     f[i] = v[i].toDouble() * inv;
+     }
+     return out;
+     }
+     double _dot4(Float32x4List a, Float32x4List b) {
+     final n = min(a.length, b.length);
+     var acc = Float32x4.zero();
+     for (var i = 0; i < n; i++) {
+     acc += a[i] * b[i];
+     }
+     return acc.x + acc.y + acc.z + acc.w;
+     }
+     List<double?> _styleScoreJob(_StyleJob j) {
+     final cc = [for (final v in j.cand) _unit4(v.cover)];
+     final ci = [for (final v in j.cand) _unit4(v.inner)];
+     final m = j.cand.length;
+     List<List<double>> scan(List<_Sv> items, List<double>? ws, int k) {
+     final tops = [for (var c = 0; c < m; c++) <double>[]];
+     for (var i = 0; i < items.length; i++) {
+     final ic = _unit4(items[i].cover);
+     final ii = _unit4(items[i].inner);
+     if (ic == null && ii == null) continue;
+     final boost = (ws != null && i < ws.length && ws[i] >= 2) ? 1.05 : 1.0;
+     for (var c = 0; c < m; c++) {
+     var s = 0.0;
+     var w = 0.0;
+     final a = cc[c];
+     if (a != null && ic != null) {
+     s += 0.35 * _dot4(a, ic);
+     w += 0.35;
+     }
+     final b = ci[c];
+     if (b != null && ii != null) {
+     s += 0.65 * _dot4(b, ii);
+     w += 0.65;
+     }
+     final v = (w == 0 ? 0.0 : s / w) * boost;
+     final top = tops[c];
+     if (top.length < k) {
+     top.add(v);
+     top.sort();
+     } else if (v > top[0]) {
+     top[0] = v;
+     top.sort();
+     }
+     }
+     }
+     return tops;
+     }
+     double mean(List<double> xs) {
+     if (xs.isEmpty) return 0.0;
+     var sum = 0.0;
+     for (final x in xs) {
+     sum += x;
+     }
+     return sum / xs.length;
+     }
+     final pos = scan(j.pos, j.posW, 5);
+     final neg = j.neg.length >= 3 ? scan(j.neg, j.negW, 3) : null;
+     final out = <double?>[];
+     for (var c = 0; c < m; c++) {
+     if (cc[c] == null && ci[c] == null) {
+     out.add(null);
+     continue;
+     }
+     final n = neg == null ? 0.0 : mean(neg[c]);
+     out.add(mean(pos[c]) - 0.5 * n);
+     }
+     return out;
      }
      class TasteRecommendPage extends StatefulWidget {
      const TasteRecommendPage({super.key});
@@ -497,14 +650,15 @@ jobs:
      static const String _kSimCacheKey = 'ai_similar_cache_v2';
      static const String _kPageCacheKey = 'ai_page_cache_v1';
      static const String _kFeedbackKey = 'ai_feedback_v1';
-     static const String _kHelpKey = 'ai_help_seen_v2';
-     static const String _kHelpText = "👍 좋아요\n· 그 작품의 작가와 태그를 AI가 '내가 좋아하는 것'으로 배워요.\n· 바로 아래에 비슷한 작품을 최대 3개 넣어 줘요. (연관 작품, 같은 작가 작품, 그 작가와 비슷한 작가의 작품)\n· 다음 뽑기부터 그 작가 작품과 비슷한 작가의 작품이 더 자주 나와요.\n· 여러 작품에 같은 태그가 자주 나오면 그 태그를 더 좋아한다고 배워요.\n\n👎 별로예요\n· 그 작품을 목록에서 빼요.\n· 그 작품의 태그와 작가는 덜 추천해요.\n· 잘못 눌렀으면 아래 알림의 '되돌리기'를 누르세요.\n\n🎨 그림체\n· 좋아한 작품(👍, 북마크, 끝까지 본 작품)의 표지와 본문 그림 3장을 폰 안의 작은 AI가 분석해요.\n· 선, 채색, 명암, 분위기가 비슷할수록 위로 올리고, 카드에 '그림체 n%'로 보여 줘요. 본문 그림을 표지보다 더 중요하게 봐요.\n· 처음 한 번은 분석에 3~5분 걸려요. 위쪽 '그림체'를 눌러 끄고 켤 수 있어요.\n\n· 같은 버튼을 한 번 더 누르면 취소되고, 배운 것도 되돌려요.\n· 누른 기록은 저장돼서 앱을 다시 켜도 계속 반영돼요.\n· '취향 n%'는 AI가 예상한, 내가 그 작품을 좋아할 확률이에요.";
+     static const String _kHelpKey = 'ai_help_seen_v3';
+     static const String _kHelpText = "👍 좋아요\n· 그 작품의 작가와 태그를 AI가 '내가 좋아하는 것'으로 배워요.\n· 바로 아래에 비슷한 작품을 최대 3개 넣어 줘요. (연관 작품, 같은 작가 작품, 그 작가와 비슷한 작가의 작품)\n· 다음 뽑기부터 그 작가 작품과 비슷한 작가의 작품이 더 자주 나와요.\n· 여러 작품에 같은 태그가 자주 나오면 그 태그를 더 좋아한다고 배워요.\n\n👎 별로예요\n· 그 작품을 목록에서 빼요.\n· 그 작품의 태그와 작가는 덜 추천해요.\n· 잘못 눌렀으면 아래 알림의 '되돌리기'를 누르세요.\n\n🎨 그림체\n· 👍한 작품, 북마크한 작품 전부, 끝까지 본 작품의 표지와 본문 그림 3장을 폰 안의 작은 AI가 분석해요.\n· 선, 채색, 명암, 분위기가 비슷할수록 위로 올리고, 카드에 '그림체 n%'로 보여 줘요. 본문 그림을 표지보다 더 중요하게 봐요.\n· 북마크는 최근 것부터 분석하고, 한 번 분석한 건 저장돼서 다시 안 해요. 북마크 100개에 1~2분쯤 걸려요.\n· 이 화면을 열어 둔 동안 분석해요. 나갔다 와도 남은 것부터 이어서 해요. 작품을 보는 동안에는 천천히 해요.\n· 모바일 데이터에서는 한 번에 60개까지만 하고, 나머지는 와이파이에서 이어서 해요.\n· 위쪽 '그림체'를 눌러 끄고 켤 수 있어요.\n\n· 같은 버튼을 한 번 더 누르면 취소되고, 배운 것도 되돌려요.\n· 누른 기록은 저장돼서 앱을 다시 켜도 계속 반영돼요.\n· '취향 n%'는 AI가 예상한, 내가 그 작품을 좋아할 확률이에요.";
      static Map<String, dynamic>? _tagIdxFile;
      static final Map<String, dynamic> _vecArtist = {};
      static final Map<String, dynamic> _vecGroup = {};
      static final Set<String> _vecMiss = {};
      static bool _vecLoaded = false;
      static const String _kStyleOnKey = 'ai_style_on_v1';
+     static const int _kStyleMobileLimit = 60; // 모바일 데이터에서 한 번에 분석할 작품 수
      static const double _kStyleW = 0.8; // 그림체가 내 취향에 가까울수록 이만큼 점수를 더해요
      final Random _rand = Random();
      _Mode _mode = _Mode.taste;
@@ -555,6 +709,10 @@ jobs:
      bool _styleBusy = false;
      int _styleDone = 0;
      int _styleTotal = 0;
+     int _styleBmDone = 0; // 그림체를 분석한 북마크 수
+     bool _styleWifiWait = false; // 모바일 데이터라서 나머지는 와이파이에서 해요
+     Timer? _slowTimer;
+     StreamSubscription<List<ConnectivityResult>>? _netSub;
      final List<(_Sv, double)> _stylePos = [];
      final List<(_Sv, double)> _styleNeg = [];
      double _maxTagCount = 0;
@@ -575,7 +733,30 @@ jobs:
      @override
      void initState() {
      super.initState();
+     _slowTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+     if (!mounted) return;
+     try {
+     _Style.setSlow(!(ModalRoute.of(context)?.isCurrent ?? true));
+     } catch (_) {}
+     });
+     try {
+     _netSub = Connectivity().onConnectivityChanged.listen((r) {
+     if (!mounted || !_styleWifiWait || _styleBusy || !_styleOn) return;
+     if (r.contains(ConnectivityResult.wifi) ||
+     r.contains(ConnectivityResult.ethernet)) {
+     _buildStyleProfile();
+     }
+     }, onError: (_) {});
+     } catch (_) {}
      _init();
+     }
+     @override
+     void dispose() {
+     _slowTimer?.cancel();
+     _netSub?.cancel();
+     _Style.setSlow(false);
+     _Style.save();
+     super.dispose();
      }
      void _setStatus(String s) {
      if (mounted) setState(() => _status = s);
@@ -2006,7 +2187,8 @@ jobs:
      }
      var styleUsed = false;
      if (styleOn) {
-     final sz = _styleZ(head);
+     final sz = await _styleZ(head);
+     if (!mounted || _mode != mode) return;
      if (sz.isNotEmpty) {
      styleUsed = true;
      for (var i = 0; i < keyed.length; i++) {
@@ -2374,7 +2556,12 @@ jobs:
      ]);
      } catch (_) {}
      if (!mounted) return;
-     final sz = _styleReady ? _styleZ(cands) : const <int, double>{};
+     final sz = _styleReady ? await _styleZ(cands) : const <int, double>{};
+     if (!mounted) return;
+     if (_mode != mode || _rollCount != roll || !_results.contains(liked)) {
+     setState(() => _expanding.remove(liked.id));
+     return;
+     }
      final ranked = [
      for (final e in top) (e.$1, e.$2 + _kStyleW * (sz[e.$1.id] ?? 0.0), e.$3),
      ]..sort((a, b) => b.$2.compareTo(a.$2));
@@ -2608,9 +2795,12 @@ jobs:
      addNeg(id, 2.0);
      }
      });
-     for (final id in _bookmarkMetas.keys) {
+     var bm = 0;
+     for (final id in _bookmarkedIds) {
+     if (_Style.emb.containsKey(id)) bm++;
      if (seen.add(id)) addPos(id, 1.0);
      }
+     _styleBmDone = bm;
      for (final id in _recentReadIds.take(300)) {
      if (!seen.add(id)) continue;
      final g = _engagement(id);
@@ -2625,53 +2815,73 @@ jobs:
      await _Style.load();
      _styleAvail = await _Style.available();
      if (!_styleAvail) return;
-     final pos = <int, QueryResult>{};
-     final neg = <int, QueryResult>{};
-     _feedback.forEach((id, v) {
-     final q = _fbMetas[id];
-     if (q == null) return;
-     if (v > 0) {
-     pos[id] = q;
-     } else {
-     neg[id] = q;
+     final order = <int>[];
+     final metas = <int, QueryResult?>{};
+     void add(int id, QueryResult? q) {
+     if (metas.containsKey(id)) return;
+     metas[id] = q;
+     order.add(id);
      }
-     });
-     final bms = _bookmarkMetas.entries.toList()..shuffle(_rand);
-     for (final e in bms.take(120)) {
-     pos.putIfAbsent(e.key, () => e.value);
+     final fb = _feedback.entries.toList().reversed.toList();
+     for (final e in fb) {
+     if (e.value > 0) add(e.key, _fbMetas[e.key]);
+     }
+     for (final id in _bookmarkedIds.toList().reversed.take(10000)) {
+     add(id, _bookmarkMetas[id]);
      }
      var engaged = 0;
+     for (final id in _recentReadIds.take(300)) {
+     if (engaged >= 40) break;
+     final q = _readMetas[id];
+     if (q != null && _engagement(id) > 0) {
+     add(id, q);
+     engaged++;
+     }
+     }
+     for (final e in fb) {
+     if (e.value < 0) add(e.key, _fbMetas[e.key]);
+     }
      var bounced = 0;
      for (final id in _recentReadIds.take(300)) {
+     if (bounced >= 30) break;
      final q = _readMetas[id];
-     if (q == null) continue;
-     final g = _engagement(id);
-     if (g > 0 && engaged < 40) {
-     pos.putIfAbsent(id, () => q);
-     engaged++;
-     } else if (g < 0 && bounced < 30) {
-     neg.putIfAbsent(id, () => q);
+     if (q != null && _engagement(id) < 0) {
+     add(id, q);
      bounced++;
      }
      }
+     _Style.keep = order.toSet();
      final todo = [
-     for (final e in [...pos.entries, ...neg.entries])
-     if (!_Style.complete(e.key)) e,
+     for (final id in order)
+     if (!_Style.complete(id)) id,
      ];
      _styleTotal = todo.length;
      _styleDone = 0;
+     _styleWifiWait = false;
      if (mounted) setState(() {});
-     for (var i = 0; i < todo.length; i += 6) {
+     var onWifi = await _onWifi();
+     var mobileOk = 0;
+     for (var i = 0; i < todo.length; i += 4) {
      if (!mounted || !_styleOn) break;
-     await Future.wait([
-     for (final e in todo.skip(i).take(6)) _Style.of(e.key, e.value),
+     if (i > 0 && i % 20 == 0) onWifi = await _onWifi();
+     if (!onWifi && mobileOk >= _kStyleMobileLimit) {
+     _styleWifiWait = true;
+     break;
+     }
+     final got = await Future.wait([
+     for (final id in todo.skip(i).take(4)) _Style.of(id, metas[id]),
      ]);
-     _styleDone = min(todo.length, i + 6);
-     if (_styleDone % 30 == 0) {
+     if (!onWifi) {
+     for (final v in got) {
+     if (v != null) mobileOk++;
+     }
+     }
+     _styleDone = min(todo.length, i + 4);
+     if (_styleDone % 20 == 0) {
      _rebuildStyleSets();
      _Style.save();
-     }
      if (mounted) setState(() {});
+     }
      }
      _rebuildStyleSets();
      await _Style.save();
@@ -2682,33 +2892,45 @@ jobs:
      if (mounted) setState(() {});
      }
      }
-     double? _styleRaw(_Sv e) {
-     if (_stylePos.length < 8) return null;
-     double topMean(List<(_Sv, double)> items, int k) {
-     final sims = [
-     for (final (v, w) in items) _Style.sim(e, v) * (w >= 2 ? 1.05 : 1.0),
-     ]..sort((a, b) => b.compareTo(a));
-     final n = min(k, sims.length);
-     if (n == 0) return 0.0;
-     var s = 0.0;
-     for (var i = 0; i < n; i++) {
-     s += sims[i];
+     Future<bool> _onWifi() async {
+     try {
+     final r = await Connectivity().checkConnectivity();
+     return r.contains(ConnectivityResult.wifi) ||
+     r.contains(ConnectivityResult.ethernet);
+     } catch (_) {
+     return false;
      }
-     return s / n;
      }
-     final pos = topMean(_stylePos, 5);
-     final neg = _styleNeg.length >= 3 ? topMean(_styleNeg, 3) : 0.0;
-     return pos - 0.5 * neg;
-     }
-     Map<int, double> _styleZ(Iterable<_Cand> list) {
-     final raw = <int, double>{};
+     Future<Map<int, double>> _styleZ(Iterable<_Cand> list) async {
+     if (_stylePos.length < 8) return const <int, double>{};
+     final ids = <int>[];
+     final cand = <_Sv>[];
      for (final c in list) {
      final e = _Style.emb[c.id];
-     if (e == null) continue;
-     final r = _styleRaw(e);
-     if (r != null) raw[c.id] = r;
+     if (e == null || ids.contains(c.id)) continue;
+     ids.add(c.id);
+     cand.add(e);
      }
-     if (raw.length < 4) return const {};
+     if (cand.length < 4) return const <int, double>{};
+     final job = _StyleJob(
+     [for (final (v, _) in _stylePos) v],
+     [for (final (_, w) in _stylePos) w],
+     [for (final (v, _) in _styleNeg) v],
+     [for (final (_, w) in _styleNeg) w],
+     cand,
+     );
+     List<double?> got;
+     try {
+     got = await compute(_styleScoreJob, job);
+     } catch (_) {
+     got = _styleScoreJob(job);
+     }
+     final raw = <int, double>{};
+     for (var i = 0; i < ids.length && i < got.length; i++) {
+     final r = got[i];
+     if (r != null) raw[ids[i]] = r;
+     }
+     if (raw.length < 4) return const <int, double>{};
      final vals = raw.values.toList();
      final mean = vals.reduce((a, b) => a + b) / vals.length;
      var v2 = 0.0;
@@ -2716,7 +2938,7 @@ jobs:
      v2 += (x - mean) * (x - mean);
      }
      final sd = sqrt(v2 / vals.length);
-     if (sd < 1e-6) return const {};
+     if (sd < 1e-6) return const <int, double>{};
      return {
      for (final e in raw.entries)
      e.key: ((e.value - mean) / sd).clamp(-2.5, 2.5).toDouble(),
@@ -2905,14 +3127,19 @@ jobs:
      lines.add("· 그림체 분석이 꺼져 있어요. 위쪽 '그림체'를 누르면 켜져요.");
      } else if (_styleBusy && _styleTotal > 0) {
      lines.add(
-     '· 그림체 분석 중... 작품 $_styleDone/$_styleTotal개 (표지와 본문 3장씩, 처음 한 번만 오래 걸려요)',
+     '· 그림체 분석 중... 작품 $_styleDone/$_styleTotal개 (북마크 전부, 최근 것부터 · 이 화면을 나가면 멈추고 다음에 이어서 해요)',
      );
      } else if (_stylePos.length >= 8) {
      lines.add(
-     '· 그림체: 좋아한 작품 ${_stylePos.length}개의 표지와 본문 그림을 기준으로, 그림체가 비슷한 작품을 더 올려 줘요.',
+     '· 그림체: 북마크 $_styleBmDone/${_bookmarkedIds.length}개를 포함해 좋아한 작품 ${_stylePos.length}개의 표지와 본문 그림을 기준으로, 그림체가 비슷한 작품을 더 올려 줘요.',
      );
      } else {
      lines.add('· 그림체: 아직 분석한 작품이 적어요. 👍를 누르거나 북마크하면 늘어나요.');
+     }
+     if (_styleOn && _styleWifiWait && !_styleBusy) {
+     lines.add(
+     '· 모바일 데이터라서 이번엔 $_kStyleMobileLimit개만 분석했어요. 나머지 북마크는 와이파이에 연결되면 이어서 해요.',
+     );
      }
      }
      if (p.similar.isNotEmpty) {
@@ -3070,6 +3297,18 @@ jobs:
      }
      }
      DART
+     # 그림체 분석이 와이파이인지 확인할 때 쓰는 라이브러리 (원본에 없으면 넣어요)
+     if ! grep -qE '^\s+connectivity_plus:' pubspec.yaml; then
+       python3 - <<'PY'
+     import re
+     s = open('pubspec.yaml', encoding='utf-8').read()
+     s2 = re.sub(r'(?m)^dependencies:[ \t]*\n', 'dependencies:\n  connectivity_plus: ^6.1.3\n', s, count=1)
+     if s2 == s:
+         raise SystemExit('pubspec dependencies not found')
+     open('pubspec.yaml', 'w', encoding='utf-8').write(s2)
+     print('connectivity_plus added')
+     PY
+     fi
   - name: Hook it into the bookmark menu
     if: steps.chk.outputs.ok == '1'
     run: |
